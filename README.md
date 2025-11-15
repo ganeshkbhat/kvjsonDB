@@ -1,2 +1,3 @@
 # kvjsonDB
-kvjsonDB - fast, secure and private, memory leak resistant redis like key value json based data store
+kvjsonDB - fast, secure and private, memory leak resistant redis like key value json based data store. an attempt to make a simple small datastore
+

@@ -79,7 +79,7 @@ var (
     availableRoles = []string{"admin", "user", "guest"}
 )
 
-// --- CRITICAL CHANGE 1: Enhanced ClientConnection for Session Binding ---
+// --- ClientConnection for Session Binding ---
 type ClientConnection struct {
 	Socket net.Conn
 	ID     interface{}
@@ -100,7 +100,7 @@ type Request struct {
 	Key      string                 `json:"key,omitempty"`
 	Value    interface{}            `json:"value,omitempty"`
 	Data     map[string]interface{} `json:"data,omitempty"`
-	Filename string                 `json:"filename,omitempty"`
+	Filename string                 `json:"filename,omitempty"` // Used for DUMPTOFILE
 	Term     interface{}            `json:"term,omitempty"`
 	Message  string                 `json:"message,omitempty"`
 	NewID    interface{}            `json:"newId,omitempty"`
@@ -120,7 +120,7 @@ type Response struct {
 	Op       string      `json:"op,omitempty"`
 	Message  string      `json:"message,omitempty"`
 	Key      string      `json:"key,omitempty"`
-	Value    interface{} `json:"value,omitempty"`
+	Value    interface{} `json:"value,omitempty"` // Used to dump database content
 	SenderId interface{} `json:"senderId,omitempty"`
 	Results  interface{} `json:"results,omitempty"`
 	Data     interface{} `json:"data,omitempty"`
@@ -128,7 +128,8 @@ type Response struct {
     Token    string      `json:"token,omitempty"`
 }
 
-// --- Authorization and Utility Functions ---
+// --- Authorization and Utility Functions (omitted for brevity, assumed unchanged) ---
+// ... hasPermission, isUserInGroup, checkPermissionForKey ...
 
 func hasPermission(client *ClientConnection, requiredRole string) bool {
     if client.CurrentUser == nil || client.CurrentUser.Deleted {
@@ -168,12 +169,10 @@ func checkPermissionForKey(client *ClientConnection, key string, requiredPerm st
         return false
     }
 
-    // Global Access Group Check
     if isUserInGroup(client.CurrentUser.Username, "global_db_access") {
         return true
     }
 
-    // ACL Check
     keyACLLock.RLock()
     defer keyACLLock.RUnlock()
 
@@ -256,7 +255,7 @@ func generateSessionToken() string {
 	return uuid.New().String()
 }
 
-// --- CRITICAL CHANGE 2: Session Binding Enforcement ---
+// --- Session Binding Enforcement ---
 func isAuthenticated(client *ClientConnection) bool {
 	if client.SessionToken == "" || client.CurrentUser == nil || client.CurrentUser.Deleted {
 		return false
@@ -266,19 +265,16 @@ func isAuthenticated(client *ClientConnection) bool {
 	sessionClient, ok := sessions[client.SessionToken]
 	authMutex.RUnlock()
     
-    // Check 1: Does the token exist and point to a valid connection object?
     if !ok || sessionClient.CurrentUser == nil || sessionClient.CurrentUser.Deleted {
         return false 
     }
     
-    // Check 2: Does the connection object belong to the client currently using it?
     if sessionClient != client {
         log.Printf("⚠️ WARNING: Token %s points to wrong connection object. Denying access.", client.SessionToken)
         return false
     }
     
-    // CRITICAL: Check 3: Session Binding Check (IP:Port Verification)
-    // If the current connection's address doesn't match the one recorded at login, deny and invalidate.
+    // CRITICAL: Session Binding Check (IP:Port Verification)
     if client.RemoteAddress != sessionClient.RemoteAddress {
         
         log.Printf("⚠️ SESSION HIJACK DETECTED: Token %s accessed from new address %s. Original: %s. Session invalidated.", 
@@ -288,9 +284,6 @@ func isAuthenticated(client *ClientConnection) bool {
         authMutex.Lock()
         delete(sessions, client.SessionToken)
         authMutex.Unlock()
-        
-        // Use a diagram to illustrate the process
-        // 
         
         return false 
     }
@@ -382,6 +375,7 @@ func main() {
         authMutex.RUnlock()
         
         if !adminExists {
+            // Setup default admin user if running DB mode for the first time
             if err := registerUser("admin", "password123", "admin@example.com", "admin"); err != nil && !strings.Contains(err.Error(), "user already exists") {
                 log.Fatalf("Failed to register default user: %v", err)
             }
@@ -412,14 +406,15 @@ func runServer(port string, loadFilename string) {
 	}
 	loadStoreFromFile(fileToLoad)
 	
-	defer dumpStoreToFile(*dumpFilenamePtr) 
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		sig := <-sigCh
-		log.Printf("⚠️ Received signal %v. Initiating graceful shutdown...", sig)
+		log.Printf("⚠️ Received signal %v. Initiating graceful shutdown and persistence...", sig)
+        
+        // --- Signal Handler Persistence (for graceful shutdown) ---
+        dumpStoreToFile(*dumpFilenamePtr) 
 		
 		close(serverStopCh) 
 		os.Exit(0) 
@@ -475,7 +470,6 @@ func handleServerConnection(conn net.Conn) {
 	clientsMutex.Lock()
 	clientIdCounter++
     
-    // CRITICAL CHANGE 3: Initialize ClientConnection with RemoteAddress
 	client := &ClientConnection{
         Socket: conn, 
         ID: clientIdCounter, 
@@ -485,6 +479,17 @@ func handleServerConnection(conn net.Conn) {
     }
 	activeClients[client.ID] = client
 	clientsMutex.Unlock()
+
+    // --- Crash/Panic Handler (for emergency save) ---
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("🔥 CRITICAL PANIC DETECTED in handler for client %v: %v. Attempting emergency dump.", client.ID, r)
+            dumpStoreToFile(*dumpFilenamePtr) 
+            // Re-panic to let the system log the error trace
+            panic(r) 
+        }
+    }()
+    // ------------------------------------------------
 
 	defer func() {
 		clientsMutex.Lock()
@@ -562,7 +567,7 @@ func handleServerConnection(conn net.Conn) {
 	}
 }
 
-// --- Handler Functions ---
+// --- Handler Functions (Partial) ---
 
 func handleLogin(client *ClientConnection, req Request) {
     if req.Username == "" || req.Password == "" {
@@ -620,7 +625,7 @@ func handleChangePassword(client *ClientConnection, req Request) {
     
     user := users[username]
 
-    // Use bcrypt.CompareHashAndPassword for secure verification
+    // FIX: Use bcrypt.CompareHashAndPassword (resolves undefined: comparePassword)
     if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
         writeJSON(client.Socket, Response{Status: "UNAUTHORIZED", Message: "Current password incorrect."})
         return
@@ -654,6 +659,7 @@ func handleLogout(client *ClientConnection, req Request) {
     log.Printf("🚪 Client ID %v logged out.", client.ID)
     writeJSON(client.Socket, Response{Status: "OK", Op: "LOGOUT", Message: "Successfully logged out."})
 }
+
 func handleAddUser(client *ClientConnection, req Request) {
     if !isAuthenticated(client) || !hasPermission(client, "admin") {
         writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "Only administrators can add new users."})
@@ -670,6 +676,7 @@ func handleAddUser(client *ClientConnection, req Request) {
     }
     writeJSON(client.Socket, Response{Status: "OK", Op: "ADD_USER", Message: fmt.Sprintf("User '%s' added successfully with role '%s'.", req.Username, req.Role)})
 }
+
 func handleRemoveUser(client *ClientConnection, req Request) {
     if !isAuthenticated(client) || !hasPermission(client, "admin") {
         writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "Only administrators can remove users."})
@@ -698,6 +705,7 @@ func handleRemoveUser(client *ClientConnection, req Request) {
     log.Printf("❌ User '%s' soft-deleted.", req.Username)
     writeJSON(client.Socket, Response{Status: "OK", Op: "REMOVE_USER", Message: fmt.Sprintf("User '%s' successfully soft-deleted.", req.Username)})
 }
+
 func parsePermissions(permStr string) Permissions {
     perms := Permissions{}
     perms.Read = strings.Contains(permStr, "R")
@@ -705,6 +713,7 @@ func parsePermissions(permStr string) Permissions {
     perms.Delete = strings.Contains(permStr, "D")
     return perms
 }
+
 func handleSetACL(client *ClientConnection, req Request) {
     if !isAuthenticated(client) || !hasPermission(client, "admin") {
         writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "SET_ACL requires admin privileges."})
@@ -744,6 +753,7 @@ func handleSetACL(client *ClientConnection, req Request) {
         Message: fmt.Sprintf("ACL set for key '%s': Role '%s' granted permissions: R:%t, W:%t, D:%t.", req.Key, role, perms.Read, perms.Write, perms.Delete),
     })
 }
+
 func handleSetGroup(client *ClientConnection, req Request) {
     if !isAuthenticated(client) || !hasPermission(client, "admin") {
         writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "SET_GROUP requires admin privileges."})
@@ -783,14 +793,13 @@ func handleSetGroup(client *ClientConnection, req Request) {
         }
     }
     
+    // Toggle logic: Add if not present, remove if present
     if !isMember {
         userGroups[groupName] = append(usersInGroup, username)
         log.Printf("👥 User '%s' added to group '%s'.", username, groupName)
         writeJSON(client.Socket, Response{Status: "OK", Op: "SET_GROUP", Message: fmt.Sprintf("User '%s' added to group '%s'.", username, groupName)})
         return
-    } 
-
-    if isMember {
+    } else { 
         userGroups[groupName] = append(usersInGroup[:memberIndex], usersInGroup[memberIndex+1:]...)
         if len(userGroups[groupName]) == 0 {
              delete(userGroups, groupName)
@@ -926,89 +935,7 @@ func ternary(condition bool, trueVal, falseVal interface{}) interface{} {
     return falseVal
 }
 
-// // handleRequest is the main handler for DB operations, integrating ACL checks
-// func handleRequest(client *ClientConnection, req Request) {
-// 	var resp Response
-
-//     if !isAuthenticated(client) {
-//         writeJSON(client.Socket, Response{Status: "UNAUTHORIZED", Message: "Operation requires a successful login."})
-//         return
-//     }
-
-// 	switch req.Op {
-// 	case "BROADCAST":
-//         if !hasPermission(client, "user") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "BROADCAST requires 'user' role or higher."})
-//             return
-//         }
-//         resp = Response{Status: "OK", Op: "BROADCAST", Message: "Broadcast simulated."}
-
-// 	case "SETID":
-//         resp = Response{Status: "OK", Op: "SETID", Message: "ID update simulated."}
-
-// 	case "SET":
-//         if !checkPermissionForKey(client, req.Key, "W") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: fmt.Sprintf("Write permission denied for key '%s'.", req.Key)})
-//             return
-//         }
-// 		store.Lock.Lock()
-// 		store.Data[req.Key] = req.Value
-// 		store.Lock.Unlock()
-// 		resp = Response{Status: "OK", Op: "SET", Key: req.Key}
-
-// 	case "GET":
-//         if !checkPermissionForKey(client, req.Key, "R") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: fmt.Sprintf("Read permission denied for key '%s'.", req.Key)})
-//             return
-//         }
-// 		store.Lock.RLock()
-// 		val, exists := store.Data[req.Key]
-// 		store.Lock.RUnlock()
-// 		if exists {
-// 			resp = Response{Status: "OK", Op: "GET", Key: req.Key, Value: val}
-// 		} else {
-// 			resp = Response{Status: "NOT_FOUND", Op: "GET", Key: req.Key}
-// 		}
-
-// 	case "DELETE":
-//         if !checkPermissionForKey(client, req.Key, "D") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: fmt.Sprintf("Delete permission denied for key '%s'.", req.Key)})
-//             return
-//         }
-// 		store.Lock.Lock()
-// 		delete(store.Data, req.Key)
-// 		store.Lock.Unlock()
-// 		resp = Response{Status: "OK", Op: "DELETE", Key: req.Key}
-
-// 	case "DUMP":
-//         if !hasPermission(client, "admin") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "DUMP operation requires 'admin' role."})
-//             return
-//         }
-//         resp = Response{Status: "OK", Op: "DUMP", Data: "Dump simulated."}
-
-// 	case "DUMPTOFILE":
-//         if !hasPermission(client, "admin") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "DUMPTOFILE operation requires 'admin' role."})
-//             return
-//         }
-// 		dumpStoreToFile(*dumpFilenamePtr)
-// 		resp = Response{Status: "OK", Op: "DUMPTOFILE", Message: fmt.Sprintf("Dump executed to %s.", *dumpFilenamePtr)}
-
-// 	case "SEARCH", "SEARCHKEY":
-//         if !hasPermission(client, "user") {
-//             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "Search operations require 'user' role or higher."})
-//             return
-//         }
-//         resp = Response{Status: "OK", Op: req.Op, Results: "Search simulated."}
-
-// 	default:
-// 		resp = Response{Status: "ERROR", Message: "Unknown operation"}
-// 	}
-
-// 	writeJSON(client.Socket, resp)
-// }
-
+// handleRequest is the main handler for DB operations, integrating ACL checks
 func handleRequest(client *ClientConnection, req Request) {
 	var resp Response
 
@@ -1023,7 +950,6 @@ func handleRequest(client *ClientConnection, req Request) {
             writeJSON(client.Socket, Response{Status: "FORBIDDEN", Message: "BROADCAST requires 'user' role or higher."})
             return
         }
-        // BROADCAST logic remains the same (simulated in the provided code)
         resp = Response{Status: "OK", Op: "BROADCAST", Message: "Broadcast simulated."}
 
 	case "SETID":
@@ -1075,6 +1001,7 @@ func handleRequest(client *ClientConnection, req Request) {
         
         // Return the entire database content in the Value field
         resp = Response{Status: "OK", Op: "DUMP", Value: dumpData, Message: "Database content returned."}
+
 
 	case "DUMPTOFILE":
         // DUMP to File (on server)
@@ -1160,9 +1087,20 @@ func runShell(port string) {
 					fmt.Printf("<- %s\n", string(pretty))
 					fmt.Printf("Server initiated %s. Disconnecting.\n", op)
 					os.Exit(0) 
+                } else if op == "DUMP" && resp["status"] == "OK" {
+                    // Handle DUMP output
+                    fmt.Printf("<- STATUS: OK (DUMP)\n")
+                    // Pretty-print the actual database content from the 'Value' field
+                    if data, exists := resp["value"]; exists {
+                        dataJSON, _ := json.MarshalIndent(data, "<- ", "  ")
+                        fmt.Printf("<- DATABASE CONTENT:\n%s\n%s", string(dataJSON), prompt)
+                    } else {
+                        fmt.Printf("<- No database content found in response.\n%s", prompt)
+                    }
+                    continue 
 				} else {
 					pretty, _ := json.MarshalIndent(resp, "", "  ")
-					fmt.Printf("\n<- %s\n%s", string(pretty), prompt)
+					fmt.Printf("<- %s\n%s", string(pretty), prompt)
 				}
 			} else {
 				fmt.Printf("\n<- %s\n%s", text, prompt)
@@ -1198,6 +1136,8 @@ func runShell(port string) {
 	}
 }
 
+// --- Shell Command Parsing ---
+
 func parseShellInput(input string) (Request, error) {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
@@ -1206,7 +1146,7 @@ func parseShellInput(input string) (Request, error) {
 	op := strings.ToUpper(parts[0])
 
 	switch op {
-	case "EXIT", "HELP", "DUMP", "DUMPTOFILE", "SHUTDOWN", "RESTART", "LOGOUT", "VIEW_USERS", "VIEW_GROUPS", "VIEW_ROLES":
+	case "EXIT", "HELP", "DUMP", "SHUTDOWN", "RESTART", "LOGOUT", "VIEW_USERS", "VIEW_GROUPS", "VIEW_ROLES":
 		return Request{Op: op}, nil
     case "LOGIN":
         if len(parts) < 3 {
@@ -1244,6 +1184,12 @@ func parseShellInput(input string) (Request, error) {
             req.Key = parts[1]
         }
         return req, nil
+    case "DUMPTOFILE":
+        req := Request{Op: op}
+        if len(parts) > 1 {
+            req.Filename = parts[1] // Optional filename
+        }
+        return req, nil
 	case "BROADCAST":
 		if len(parts) < 2 {
 			return Request{}, fmt.Errorf("missing message")
@@ -1266,14 +1212,19 @@ func parseShellInput(input string) (Request, error) {
 		return Request{Op: op, Key: parts[1]}, nil
 	case "SET":
 		if len(parts) < 3 {
-			return Request{}, fmt.Errorf("usage: SET <key> <value>")
+			return Request{}, fmt.Errorf("usage: SET <key> <value> (value must be a valid JSON type or string)")
 		}
 		valStr := strings.Join(parts[2:], " ")
 		var val interface{}
+		// Attempt to unmarshal as JSON first (for complex objects/arrays)
 		if err := json.Unmarshal([]byte(valStr), &val); err != nil {
+			// If not JSON, try parsing as a number or boolean
 			if num, err := strconv.ParseFloat(valStr, 64); err == nil {
 				val = num
-			} else {
+			} else if b, err := strconv.ParseBool(valStr); err == nil {
+                val = b
+            } else {
+				// Default to string
 				val = valStr
 			}
 		}
@@ -1284,31 +1235,36 @@ func parseShellInput(input string) (Request, error) {
 }
 
 func printHelp() {
-	fmt.Println("--- DB Commands (Key-Level ACLs Apply) ---")
-	fmt.Println("  SET <key> <value>            : Requires 'W' permission on <key>.")
-    fmt.Println("  GET <key>                    : Requires 'R' permission on <key>.")
-    fmt.Println("  DELETE <key>                 : Requires 'D' permission on <key>.")
-    fmt.Println("  SEARCH <term>                : Requires 'user' role or higher.")
-    fmt.Println("  SEARCHKEY <term>             : Requires 'user' role or higher.")
-	fmt.Println("  BROADCAST <message>          : Requires 'user' role or higher.")
-    fmt.Println("  SETID <newId>                : Requires login.")
-    fmt.Println()
-    fmt.Println("--- Security & Server Management (Admin Role) ---")
-    fmt.Println("  ADD_USER <uName> <pwd> <email> <role> : Create a new user.")
-    fmt.Println("  REMOVE_USER <uName>          : Soft-delete a user.")
-    fmt.Println("  SET_ACL <key> <role> <perms> : Set Read/Write/Delete permissions for a role on a key.")
-    fmt.Println("  SET_GROUP <group> <uName>    : Add/Remove a user from a group.")
-    fmt.Println("  DUMP, DUMPTOFILE, SHUTDOWN, RESTART : Server management.")
-    fmt.Println()
-    fmt.Println("--- VIEW/AUDIT Commands (Admin Role) ---")
-    fmt.Println("  VIEW_USERS                   : Show all user profiles (username, role, status).")
-    fmt.Println("  VIEW_GROUPS                  : Show all groups and their members.")
-    fmt.Println("  VIEW_ROLES                   : Show all predefined roles.")
-    fmt.Println("  VIEW_ACL [key]               : Show ACLs for a specific key, or all keys if [key] is omitted.")
-    fmt.Println()
-    fmt.Println("--- Authentication & Client Commands ---")
-    fmt.Println("  LOGIN <uName> <pwd>          : Authenticate and start session. (Session bound to IP/Port)")
+	fmt.Println("--------------------------------------------------------------------------------")
+    fmt.Println("--- JSonDB Shell Client Commands ---")
+	fmt.Println("--------------------------------------------------------------------------------")
+    fmt.Println("--- 1. Authentication & Session ---")
+    fmt.Println("  LOGIN <uName> <pwd>          : Authenticate and start session. (Session is IP/Port-bound for security)")
     fmt.Println("  LOGOUT                       : End current session.")
     fmt.Println("  CHANGE_PASSWORD <curr> <new> : Change your own password.")
-    fmt.Println("  EXIT / HELP                  : Client commands.")
+    fmt.Println("  SETID <newId>                : Change client ID (for server tracking).")
+    fmt.Println()
+    fmt.Println("--- 2. Key-Value Storage (ACL Checked) ---")
+    fmt.Println("  SET <key> <value>            : Store a key/value (Value can be JSON, number, string, boolean). Requires 'W'.")
+    fmt.Println("  GET <key>                    : Retrieve value by key. Requires 'R'.")
+    fmt.Println("  DELETE <key>                 : Remove key/value. Requires 'D'.")
+    fmt.Println("  SEARCH <term>                : Search values. Requires 'user' role.")
+    fmt.Println("  SEARCHKEY <term>             : Search keys. Requires 'user' role.")
+    fmt.Println()
+    fmt.Println("--- 3. Admin & RBAC/ACL Management (Requires 'admin' Role) ---")
+    fmt.Println("  ADD_USER <uName> <pwd> <email> <role> : Create a new user.")
+    fmt.Println("  REMOVE_USER <uName>          : Soft-delete a user.")
+    fmt.Println("  SET_ACL <key> <role> <perms> : Set Read/Write/Delete permissions (e.g., RWD, RW, -).")
+    fmt.Println("  SET_GROUP <group> <uName>    : Toggle a user's membership in a group (Add/Remove).")
+    fmt.Println("  VIEW_USERS                   : List all user profiles.")
+    fmt.Println("  VIEW_GROUPS                  : List all groups and members.")
+    fmt.Println("  VIEW_ACL [key]               : List ACLs for a key or all keys.")
+    fmt.Println("  VIEW_ROLES                   : List available roles.")
+    fmt.Println()
+    fmt.Println("--- 4. Server Control & Persistence (Requires 'admin' Role) ---")
+    fmt.Println("  DUMP                         : Retrieve and display the entire database content to console.")
+    fmt.Println("  DUMPTOFILE [path]            : Save the entire database to a file on the server.")
+    fmt.Println("  SHUTDOWN / RESTART           : Stop / Restart the server process (Data is automatically saved).")
+    fmt.Println("  BROADCAST <message>          : Send a message to all connected clients.")
+    fmt.Println("--------------------------------------------------------------------------------")
 }

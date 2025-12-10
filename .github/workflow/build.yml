@@ -1,0 +1,71 @@
+name: Go Cross-Platform Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    # Use a matrix to define the combinations of OS and Architecture
+    strategy:
+      fail-fast: false
+      matrix:
+        # Define the target operating systems (GOOS)
+        goos: [windows, linux, darwin]
+        # Define the target architectures (GOARCH)
+        goarch: [amd64, arm64]
+        
+        # Exclude combinations that are generally not needed or complex:
+        # 1. Windows on ARM64 for standard executables (less common for CLI apps)
+        # 2. Linux on ARM32 (if 'arm' is needed, add it to goarch and exclude where necessary)
+        # 3. Darwin (macOS) on amd64 is sometimes excluded, but included here for older/Intel Macs
+        exclude:
+          - goos: windows
+            goarch: arm64
+          # If you only support modern Macs (M1/M2/etc.), you can uncomment this line:
+          # - goos: darwin
+          #   goarch: amd64
+
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: ⬇️ Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🛠️ Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21' # Specify your desired Go version
+
+      - name: ⚙️ Build for ${{ matrix.goos }}/${{ matrix.goarch }}
+        # Set the GOOS and GOARCH environment variables for cross-compilation
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0 # Disable CGO for static binaries (recommended for cross-compilation)
+        run: |
+          # Define the output file extension based on the OS
+          BINARY_NAME="myapp"
+          OUTPUT_EXT=""
+          if [ "$GOOS" == "windows" ]; then
+            OUTPUT_EXT=".exe"
+          fi
+
+          # The final binary name
+          FINAL_BINARY_NAME="${BINARY_NAME}-${GOOS}-${GOARCH}${OUTPUT_EXT}"
+          
+          # Execute the Go build command
+          # -ldflags="-s -w" removes symbol and debug information, making the binary smaller
+          go build -ldflags="-s -w" -o ./build/${FINAL_BINARY_NAME} .
+          
+      - name: 📦 Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ./build/

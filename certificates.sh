@@ -23,8 +23,7 @@ openssl genrsa -out server.key 2048
 openssl req -new -key server.key -out server.csr -config san.cnf
 
 # 4. Sign SERVER Cert using CA (Includes SANs!)
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out server.crt -days 365 -extensions v3_req -extfile san.cnf
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -extensions v3_req -extfile san.cnf
 
 # 5. Generate CLIENT Key and CSR
 openssl genrsa -out client.key 2048

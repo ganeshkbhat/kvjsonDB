@@ -24,12 +24,25 @@ go run jsondb.go -s db --cert server.crt --key server.key --ca-cert ca.crt -l st
 
 -->
 
+## DB server
 
-go run main.go -s=db -h=0.0.0.0 -p=8080 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=initial_data.json -dt=1h 
+```
+go run main.go -s=db -h=0.0.0.0 -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
+```
 
+```
+go run main.go -s=db -h=localhost -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
+```
 
-go run main.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=192.168.1.10 -p=8888   
+## DB shell
 
+```
+go run main.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=192.168.1.10 -p=7000   
+```
+
+```
+go run main.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=localhost -p=7000   
+```
 
 
 
@@ -163,3 +176,9 @@ All data operations are subject to ACL checks based on the authenticated user's 
 | `LOAD` | `LOAD <filename>` | Admin Required | Triggers the server to load data from the specified file (merging it) and reload the security store (overwriting it). |
 | `HELP` | `HELP` | | Displays the full list of shell commands. |
 | `EXIT` / `QUIT` | `EXIT` / `QUIT` | | Closes the shell application. |
+
+
+### Certificates 
+###### for local development and self signed certificates
+[san.cnf](https://github.com/ganeshkbhat/kvjsonDB/blob/main/san.cnf) - 
+[certificates.sh](https://github.com/ganeshkbhat/kvjsonDB/blob/main/certificates.sh)

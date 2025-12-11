@@ -182,3 +182,55 @@ All data operations are subject to ACL checks based on the authenticated user's 
 ###### for local development and self signed certificates
 [san.cnf](https://github.com/ganeshkbhat/kvjsonDB/blob/main/san.cnf) - 
 [certificates.sh](https://github.com/ganeshkbhat/kvjsonDB/blob/main/certificates.sh)
+
+
+# 💾 Security Database Persistence Changes
+
+The following outlines the necessary conceptual and implementation changes to ensure the security database (users, ACLs, groups, etc.) is reliably stored (persisted) even when the program exits or crashes.
+
+## 1. Security Persistence in Server Startup Flags (Reference)
+
+The `--security-dump-file` flag defines the persistence path. Data is loaded from and saved to this file.
+
+| Flag Short | Flag Long | Description | Default Value | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `-sdf` | `--security-dump-file` | **Security Dump File:** Filename for persistence of Users, Groups, and ACLs. | `security_db_dump.json` | **Data is loaded from and saved to this file.** |
+
+## 2. Implementation Strategy Changes (High-Level Logic)
+
+To achieve reliable persistence, two primary mechanisms must be implemented in the server's code: a **Graceful Shutdown Handler** and an **Atomic Write Process**.
+
+### A. Graceful Shutdown Handler
+
+The server must register a signal handler to catch standard termination signals (e.g., `SIGINT`, `SIGTERM`). This ensures a cleanup routine is executed before the process ends. 
+
+$$\text{Signal Handler Logic} \rightarrow \text{Graceful Shutdown Routine} \rightarrow \text{Persistence Layer Save}(\text{Security DB}) \rightarrow \text{Exit}$$
+
+**Graceful Shutdown Routine steps:**
+
+1.  Stop the server's network listener.
+2.  Close any active client sessions.
+3.  Execute the **Security Data Store Atomic Save function** (see point B).
+4.  Exit cleanly with status 0.
+
+### B. Crash/Mid-Write Protection (Atomic Save)
+
+To prevent the security file from being corrupted if the server crashes or loses power while writing, the save operation must be **atomic**.
+
+**Atomic Save Mechanism:**
+
+1.  Write the entire new security state to a **temporary file** (`security_db_dump.json.tmp`).
+2.  Once the write is complete, atomically **rename** the temporary file over the final destination file (`security_db_dump.json`). 
+    * *Note: Renaming is typically an atomic operation at the file system level, meaning the main file is never in a half-written state.*
+
+---
+
+## Summary of Behavioral Changes:
+
+| Action | Previous Behavior | New Behavior |
+| :--- | :--- | :--- |
+| **Server Stop (`SIGINT`, `SIGTERM`)** | Data was only saved via periodic dump (`-dt`) or `DUMP` command. | Security state is **always saved** to `-sdf` file during graceful shutdown. |
+| **Program Crash (e.g., Segfault)** | Data written since the last periodic dump is lost. | **Rollback protection:** The `security_db_dump.json` file will contain the last **complete** successful state, avoiding corruption. |
+| **Data Load on Startup** | Loads the initial state from `-sdf`. | If the server was shut down correctly, it loads the most recent state. If it crashed, it loads the last known complete state. |
+
+

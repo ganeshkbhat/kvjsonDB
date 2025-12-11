@@ -1,0 +1,28 @@
+{
+  "users": {
+    "admin": {
+      "id": "admin",
+      "password": "$2a$10$RQ6p6fbx8rl3SGRrYBA/ZerUAa67HNKnwoRLiI7DeBSXeqpmNFkOG",
+      "groups": [
+        "admin"
+      ]
+    }
+  },
+  "groups": {
+    "admin": {
+      "id": "admin",
+      "members": [
+        "admin"
+      ]
+    }
+  },
+  "aclStore": {
+    "security_db": {
+      "userPermissions": {
+        "admin": 4
+      },
+      "groupPermissions": null,
+      "default": 0
+    }
+  }
+}

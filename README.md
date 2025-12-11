@@ -31,30 +31,39 @@ go run main.go -s=db -h=0.0.0.0 -p=8080 -dt=30m -log=app.log -cert=server.crt -k
 go run main.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=192.168.1.10 -p=8888   
 
 
-Command,Usage,Description
-SET,SET <key> <value/json>,Sets a key-value pair. The value can be a simple string or a valid JSON structure.
-GET,GET <key>,Retrieves the value associated with the specified key.
-DELETE,DELETE <key>,"Removes the key-value pair. If the key points to a BLOB, the associated file is also deleted."
-
-Command,Usage,Description
-PUTBLOB,PUTBLOB <key> <local_file_path>,Uploads the local file to the server's BLOB storage and registers it under <key>.
-GETBLOB,GETBLOB <key>,Downloads the BLOB stored under <key>. Saves the file locally as retrieved_<original_name>.
-DELETEBLOB,DELETEBLOB <key>,Explicitly deletes the BLOB object and its associated file on the server. Fails if the key is not a BLOB.
-
-Command,Usage,Description
-SEARCH,SEARCH <string>,Searches for the <string> within both key names and JSON values.
-SEARCHKEY,SEARCHKEY <substring>,Finds all keys that contain the specified <substring>.
-DELETEKEY,DELETEKEY <substring>,DANGER: Deletes all keys (and associated BLOB files) that contain the specified <substring>.
-
-Command,Usage,Description
-CONNECT,CONNECT -h <host> -p <port> [-cert <path> ...],"Reconnects or connects to a different server address, optionally updating client certificates."
-DISCONNECT,DISCONNECT,Closes the current network connection without exiting the shell.
-DUMP,DUMP [filename],Triggers the server to save the current database state to the specified file (or the default dump file).
-LOAD,LOAD <filename>,Triggers the server to load and merge data from the specified file into the current store.
-HELP,HELP,Displays the help message in the shell.
-EXIT / QUIT,EXIT,Closes the connection and exits the client shell program.
 
 
+# 📄 JSON DB Server and Client Shell Readme
+
+This document provides a comprehensive guide to running the `jsondb` executable in both **DB Server Mode** and **Client Shell Mode**, including all necessary startup flags, their defaults, and a complete reference for all available shell commands.
+
+---
+
+## 1. DB Server Mode Startup Prefixes and Defaults
+
+To run the server, use the flag `-s db` or `--mode db`. The server strictly uses Mutual TLS (mTLS) for security.
+
+| Flag Short | Flag Long | Description | Default Value | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `-s` | `--mode` | **Mode:** Defines the execution type. | `db` | Must be `db` for server. |
+| `-h` | `--host` | **Host:** The interface the server listens on. | `localhost` | Use `0.0.0.0` to listen on all interfaces. |
+| `-p` | `--port` | **Port:** The TCP port the server listens on. | `9999` | |
+| `-c` | `--cert` | **Server Certificate Path** | `server.crt` | Server's public certificate chain for mTLS. |
+| `-k` | `--key` | **Server Private Key Path** | `server.key` | Server's private key for mTLS. |
+| `-ca` | `--ca-cert` | **Root CA Certificate Path** | `ca.crt` | The CA used to sign both the server and client certificates. |
+| `-df` | `--dump-file` | **Data Dump File:** Filename for persistence of the main data store. | `store_dump.json` | |
+| `-sdf` | `--security-dump-file` | **Security Dump File:** Filename for persistence of Users, Groups, and ACLs. | `security_db_dump.json` | |
+| `-l` | `--load` | **Load File:** Initial file to load data from on startup. | Value of `--dump-file` | If not specified, loads from the current dump file. |
+| `-dt` | `--dump-time` | **Periodic Dump Interval:** Duration for automatically saving the store. | `30m` (30 minutes) | Set to `0s` to disable periodic dumping. |
+| `--log` | N/A | **Log File:** Path to the server log file. | `server.log` | Use `""` (empty string) to disable file logging. |
+
+### Example Server Startup
+```bash
+# Basic startup (assumes server.crt, server.key, ca.crt exist in the working directory)
+./jsondb -s db
+
+# Startup with custom port and disabled periodic dump
+./jsondb -s db -p 8080 -dt 0s -log server.log
 
 
 

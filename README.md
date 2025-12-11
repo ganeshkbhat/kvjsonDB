@@ -27,21 +27,29 @@ go run jsondb.go -s db --cert server.crt --key server.key --ca-cert ca.crt -l st
 ## DB server
 
 ```
-go run main.go -s=db -h=0.0.0.0 -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
+./jsondb -s=db -h=0.0.0.0 -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
 ```
 
 ```
-go run main.go -s=db -h=localhost -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
+go run jsondb.go -s=db -h=0.0.0.0 -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
+```
+
+```
+go run jsondb.go -s=db -h=localhost -p=7000 -dt=30m -log=app.log -cert=server.crt -key=server.key -ca-cert=ca.crt -l=store_dump.json -dt=1h 
 ```
 
 ## DB shell
 
 ```
-go run main.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=192.168.1.10 -p=7000   
+./jsondb -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=192.168.1.10 -p=7000   
 ```
 
 ```
-go run main.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=localhost -p=7000   
+go run jsondb.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=192.168.1.10 -p=7000   
+```
+
+```
+go run jsondb.go -s=shell -cert=client.crt -key=client.key -ca-cert=ca.crt -h=localhost -p=7000   
 ```
 
 

@@ -1,4 +1,50 @@
 {
-  "aminer": "trail",
-  "test": 10
+  "6b718537-57ff-4fd2-9e71-1075cda16895": {
+    "ipAddress": "127.0.0.1:54891",
+    "lastActivity": "2025-12-10T11:29:27.3969587Z",
+    "loginTime": "2025-12-10T10:44:08.1486393Z",
+    "sessionToken": "6b718537-57ff-4fd2-9e71-1075cda16895",
+    "username": "ge"
+  },
+  "97a16fdf-1360-4ad6-ac26-43dba233ffc9": {
+    "ipAddress": "127.0.0.1:58358",
+    "lastActivity": "2025-12-10T11:29:27.3969587Z",
+    "loginTime": "2025-12-10T10:51:09.4729715Z",
+    "sessionToken": "97a16fdf-1360-4ad6-ac26-43dba233ffc9",
+    "username": "admin"
+  },
+  "admin": {
+    "deleted": false,
+    "passwordHash": "$2a$10$7Uy.hYrmvkmFhS0LPm72ieGTOL38XWX8IZY9HsJZ9vbTFwad/WJce",
+    "role": "admin",
+    "userEmail": "admin@example.com",
+    "username": "admin"
+  },
+  "brainwash": "yes",
+  "gb": {
+    "deleted": false,
+    "passwordHash": "$2a$10$rr/Nc9vv3WZAaPgu7C.4s.rjsKJkRiDDSBPET9S4yhXe/26hL8NaC",
+    "role": "user",
+    "userEmail": "g@g.com",
+    "username": "gb"
+  },
+  "gbe": {
+    "deleted": false,
+    "passwordHash": "$2a$10$6FNXI4POOmtMAm4Z.sy26usoZXX/TAbCnoUnG5DRHnjhW7VGR383S",
+    "role": "guest",
+    "userEmail": "ge@g.com",
+    "username": "gbe"
+  },
+  "ge": {
+    "deleted": false,
+    "passwordHash": "$2a$10$3xvYAB3rB.nu1MVZqY5JM.XHq4BhIFEy3ZVsgRaIFMQRLOIWa3dbi",
+    "role": "gui",
+    "userEmail": "e@g.com",
+    "username": "ge"
+  },
+  "getlost": "shutup",
+  "name": "ganesh",
+  "test": "testing",
+  "whois": "vaueshit",
+  "why": "set"
 }

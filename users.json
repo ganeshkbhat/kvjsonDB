@@ -1,0 +1,29 @@
+{
+  "admin_user": {
+    "username": "admin_user",
+    "email": "admin@example.com",
+    "createdAt": "2025-12-11T15:18:47.5818309+05:30",
+    "defaultRole": "admin",
+    "active": true,
+    "deleted": false,
+    "deletedAt": "0001-01-01T00:00:00Z"
+  },
+  "client_user": {
+    "username": "client_user",
+    "email": "client@example.com",
+    "createdAt": "2025-12-11T15:18:47.5818309+05:30",
+    "defaultRole": "user",
+    "active": true,
+    "deleted": false,
+    "deletedAt": "0001-01-01T00:00:00Z"
+  },
+  "inactive_user": {
+    "username": "inactive_user",
+    "email": "inactive@example.com",
+    "createdAt": "2025-12-11T15:18:47.5818309+05:30",
+    "defaultRole": "user",
+    "active": false,
+    "deleted": false,
+    "deletedAt": "0001-01-01T00:00:00Z"
+  }
+}

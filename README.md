@@ -14,8 +14,8 @@ go run jsondb.go -s=db -h 10.0.0.5 -p 8080
 go run jsondb.go  -s=db -h 0.0.0.0 -p 9999
 
 # Run the client shell and connect to the server
-./json-db -s shell --cert client.crt --key client.key --ca-cert ca.crt
-go run jsondb.go -s shell --cert client.crt --key client.key --ca-cert ca.crt
+./json-db -s shell --cert client.crt --key client.key --ca-cert ca.crt -h 0.0.0.0 -p 9999
+go run jsondb.go -s shell --cert client.crt --key client.key --ca-cert ca.crt -h 0.0.0.0 -p 9999
 
 # Run the server on port 9999 (default)
 ./json-db -s db --cert server.crt --key server.key --ca-cert ca.crt -l initial_data.json -h 0.0.0.0 -p 9999

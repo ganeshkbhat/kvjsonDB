@@ -1,4 +1,30 @@
 {
-  "name": "yesright",
-  "naming": "test"
+  "aclStore": {
+    "security_db": {
+      "default": 0,
+      "groupPermissions": null,
+      "userPermissions": {
+        "admin": 4
+      }
+    }
+  },
+  "ganesh": "not here",
+  "groups": {
+    "admin": {
+      "id": "admin",
+      "members": [
+        "admin"
+      ]
+    }
+  },
+  "names": "names",
+  "users": {
+    "admin": {
+      "groups": [
+        "admin"
+      ],
+      "id": "admin",
+      "password": "$2a$10$RQ6p6fbx8rl3SGRrYBA/ZerUAa67HNKnwoRLiI7DeBSXeqpmNFkOG"
+    }
+  }
 }

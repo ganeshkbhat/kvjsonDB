@@ -1,92 +1,243 @@
-const JsonDbClient = require('./node.api'); // Make sure path is correct
+const net = require('net');
+const { Writable } = require('stream');
 
-// --- Configuration ---
-const config = {
-    host: 'localhost',
-    port: 7000,
-    // IMPORTANT: Update these paths to your actual certificate files
-    clientCertPath: './client.crt', 
-    clientKeyPath: './client.key',
-    caCertPath: './ca.crt',
-};
+// --- Configuration (Matches server defaults) ---
+const API_HOST = 'localhost';
+const API_PORT = 8888;
 
-async function main() {
-    const client = new JsonDbClient(config);
+// --- API Client Class ---
 
-    try {
-        // 1. Establish mTLS Connection
-        console.log('Attempting to connect to the server...');
-        await client.connect();
-        
-        // 2. Login to get a session token (assuming 'admin_user' exists and has permissions)
-        console.log('\n--- Authentication ---');
-        const USER_ID = 'admin';
-        const PASSWORD = 'password';
-        
-        const loginResponse = await client.login(USER_ID, PASSWORD);
-        console.log(`✅ Login successful! Session token details:`, loginResponse);
-        
-        // 3. Run Data Commands (Requires READ/WRITE permissions on the key)
-        console.log('\n--- Data Operations (SET/GET/DELETE) ---');
-        const dataKey = 'config:app:settings';
-        const dataValue = { version: 2.1, maintenance_mode: false };
-        
-        // SET operation
-        console.log(`Writing value to key: ${dataKey}`);
-        const setResponse = await client.set(dataKey, dataValue);
-        console.log('SET Response:', setResponse);
+class APIClient {
+    /**
+     * @param {string} host 
+     * @param {number} port 
+     */
+    constructor(host, port) {
+        this.host = host;
+        this.port = port;
+        /** @type {net.Socket | null} */
+        this.client = null;
+        /** @type {Promise<net.Socket>} */
+        this.connectionPromise = this.connect();
+        /** @type {Function[]} */
+        this.commandQueue = [];
+        this.isProcessing = false;
+        this.buffer = ''; // Buffer for incoming data
+    }
 
-        // GET operation
-        console.log(`\nReading value from key: ${dataKey}`);
-        const getResponse = await client.get(dataKey);
-        // Data returned from server is likely a JSON string, so we parse it here
-        const parsedValue = JSON.parse(getResponse);
-        console.log('GET Result (Parsed):', parsedValue); 
-        
-        // 4. Run Security/Admin Commands (Requires ADMIN permission on 'security_db')
-        console.log('\n--- Security Operations (Admin Required) ---');
-        const newUserId = 'analytics_service';
-        
-        // CREATEUSER operation
-        console.log(`Creating new user: ${newUserId}`);
-        const createUserResponse = await client.createUser(newUserId, 'api_token_123');
-        console.log('CREATEUSER Response:', createUserResponse);
+    /**
+     * Establishes a single, persistent TCP connection.
+     * @returns {Promise<net.Socket>}
+     */
+    connect() {
+        return new Promise((resolve, reject) => {
+            const client = new net.Socket();
+            this.client = client;
 
-        // SETPERM operation: Granting READ (1) permission to the new user on the data key
-        console.log(`\nGranting READ permission to user ${newUserId} on key ${dataKey}`);
-        const setPermResponse = await client.setPermission(dataKey, 'user', newUserId, 1);
-        console.log('SETPERM Response:', setPermResponse);
-        
-        // 5. Cleanup
-        console.log('\n--- Cleanup ---');
-        
-        // DELETE operation
-        console.log(`Deleting data key: ${dataKey}`);
-        await client.delete(dataKey);
+            client.connect(this.port, this.host, () => {
+                console.log(`[API Client] Connected to ${this.host}:${this.port}`);
+                resolve(client);
+            });
 
-        // DELETEUSER operation
-        console.log(`Deleting new user: ${newUserId}`);
-        await client.deleteUser(newUserId);
-        
-    } catch (error) {
-        console.error('\n❌ --- A CRITICAL ERROR OCCURRED ---');
-        if (error.code) {
-            console.error(`[${error.code}] ${error.message}`);
-        } else {
-            console.error(error);
+            // Set up data listener to handle responses
+            client.on('data', (data) => {
+                this.buffer += data.toString();
+                this.processResponses();
+            });
+
+            client.on('error', (err) => {
+                console.error(`[API Client] Socket Error: ${err.message}`);
+                this.disconnect();
+                reject(new Error(`Connection failed: ${err.message}`));
+            });
+
+            client.on('close', () => {
+                console.log('[API Client] Connection closed.');
+                this.client = null;
+                // Reject any remaining commands in the queue
+                this.rejectQueue(new Error("Connection closed unexpectedly."));
+            });
+        });
+    }
+
+    /**
+     * Processes the incoming buffer data, looking for JSON responses delimited by newline.
+     */
+    processResponses() {
+        let newlineIndex;
+        // Check for complete messages (delimited by \n)
+        while ((newlineIndex = this.buffer.indexOf('\n')) !== -1) {
+            const rawResponse = this.buffer.substring(0, newlineIndex);
+            this.buffer = this.buffer.substring(newlineIndex + 1);
+
+            // Resolve the oldest waiting command in the queue
+            const resolveCommand = this.commandQueue.shift(); 
+            if (resolveCommand) {
+                try {
+                    const response = JSON.parse(rawResponse.trim());
+                    resolveCommand.resolve(response);
+                } catch (error) {
+                    console.error(`[API Client] Failed to parse JSON. Raw: ${rawResponse.trim()}`);
+                    resolveCommand.reject(new Error(`Error unmarshalling response: ${error.message}`));
+                }
+            }
         }
-    } finally {
-        // Ensure connection and session are properly closed
-        if (client.isAuthenticated) {
-             console.log('\nLogging out session...');
-             await client.logout().catch(e => console.error('Warning: Logout failed:', e.message));
+    }
+    
+    /**
+     * Rejects all promises currently waiting in the command queue.
+     * @param {Error} error 
+     */
+    rejectQueue(error) {
+        while (this.commandQueue.length > 0) {
+            this.commandQueue.shift().reject(error);
         }
-        if (client.isConnected()) {
-             client.disconnect();
-             console.log('Client disconnected from socket.');
+    }
+
+
+    /**
+     * Sends a Command object and waits for a Response on the persistent connection.
+     * @param {Object} command 
+     * @returns {Promise<Object>}
+     */
+    async executeCommand(command) {
+        // Wait for the connection to be established
+        await this.connectionPromise;
+
+        return new Promise((resolve, reject) => {
+            // 1. Queue the promise callbacks
+            this.commandQueue.push({ resolve, reject });
+
+            // 2. Send the request
+            try {
+                const jsonCommand = JSON.stringify(command);
+                // Ensure the client is still available before writing
+                if (this.client && !this.client.destroyed) {
+                    this.client.write(jsonCommand + '\n');
+                } else {
+                    reject(new Error("Connection is not active."));
+                }
+            } catch (error) {
+                // If writing fails, remove the command from the queue
+                this.commandQueue.pop(); 
+                reject(new Error(`Error marshalling/writing command: ${error.message}`));
+            }
+        });
+    }
+
+    /**
+     * Closes the persistent TCP connection.
+     */
+    disconnect() {
+        if (this.client) {
+            this.client.end();
         }
     }
 }
 
-main();
+// ---------------------------------------------------------------------
+// --- Specific API Methods (Wrappers) ---
+// ---------------------------------------------------------------------
 
+/**
+ * Creates an API object tied to the client instance.
+ * @param {APIClient} client 
+ */
+const createAPIWrappers = (client) => ({
+    /** @param {string} key */
+    get: (key) => client.executeCommand({ Op: "GET", Key: key }),
+    
+    /** @param {string} key @param {*} value */
+    set: (key, value) => client.executeCommand({ Op: "SET", Key: key, Value: value }),
+    
+    /** @param {string} key */
+    delete: (key) => client.executeCommand({ Op: "DELETE", Key: key }),
+    
+    dump: () => client.executeCommand({ Op: "DUMP" }),
+
+    /** @param {string} term */
+    search: (term) => client.executeCommand({ Op: "SEARCH", Term: term }),
+
+    /** @param {string} term */
+    searchKey: (term) => client.executeCommand({ Op: "SEARCHKEY", Term: term }),
+
+    /** @param {Object} data */
+    load: (data) => client.executeCommand({ Op: "LOAD", Data: data }),
+});
+
+// ---------------------------------------------------------------------
+// --- Example Usage ---
+// ---------------------------------------------------------------------
+
+async function runExamples() {
+    const client = new APIClient(API_HOST, API_PORT);
+    const API = createAPIWrappers(client);
+    
+    try {
+        // Ensure connection is ready before starting tests
+        await client.connectionPromise; 
+
+        // --- Test 1: SET (key, string value) ---
+        const setKey = "device:abc";
+        let resp = await API.set(setKey, "Smart Switch v1");
+        console.log(`\n--- SET ${setKey} ---`);
+        if (resp.status === "OK") {
+            console.log(`✅ Success: Key ${setKey} set.`);
+        } else {
+            console.log(`❌ Error: ${resp.status} - ${resp.message}`);
+        }
+
+        // --- Test 5: DUMP all data ---
+        resp = await API.dump();
+        console.log(`\n--- DUMP ---`);
+        console.log(`\n`, resp);
+
+        // --- Test 2: GET (key) ---
+        resp = await API.get(setKey);
+        console.log(`\n--- GET ${setKey} ---`);
+        if (resp.status === "OK") {
+            console.log(`✅ Success: Value: ${resp.value}`);
+        } else {
+            console.log(`❌ Error: ${resp.status} - ${resp.message}`);
+        }
+
+        // --- Test 3: SET (key, JSON object value) ---
+        const jsonValue = { location: "kitchen", status: "on", temp: 24.5 };
+        const jsonKey = "sensor:temp";
+        resp = await API.set(jsonKey, jsonValue);
+        console.log(`\n--- SET ${jsonKey} ---`);
+        if (resp.status === "OK") {
+            console.log("✅ Success: JSON object set.");
+        } else {
+            console.log(`❌ Error: ${resp.status} - ${resp.message}`);
+        }
+
+        // --- Test 4: SEARCH (term) ---
+        const searchTerm = "kitchen";
+        resp = await API.search(searchTerm);
+        console.log(`\n--- SEARCH "${searchTerm}" ---`);
+        if (resp.status === "OK") {
+            console.log("✅ Success: Results found:");
+            console.log(JSON.stringify(resp.results, null, 2));
+        } else {
+            console.log(`❌ Error: ${resp.status} - ${resp.message}`);
+        }
+
+        // --- Test 5: DUMP all data ---
+        resp = await API.dump();
+        console.log(`\n--- DUMP ---`);
+        if (resp.status === "OK") {
+            console.log("Store Contents:");
+            console.log(JSON.stringify(resp.data, null, 2));
+        } else {
+            console.log(`❌ Error: ${resp.status} - ${resp.message}`);
+        }
+
+    } catch (error) {
+        console.error(`\n[FATAL ERROR]`, error.message);
+    } finally {
+        client.disconnect();
+    }
+}
+
+runExamples();

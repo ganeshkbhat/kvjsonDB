@@ -182,22 +182,18 @@ func (c *ClientContext) handleResponse(rawResp []byte) {
         }
     }
     
-    isSynchronous := true
-
 	switch resp.Status {
 	case "OK":
 		switch resp.Op {
 		case "GET":
 			// Output GET data prettily
 			if resp.Value != nil {
-				// The value is guaranteed to be a valid JSON type (string, number, map, array, null)
 				data, _ := json.MarshalIndent(resp.Value, "", "  ")
 				fmt.Printf("%s\n", data)
 			} else {
 				fmt.Printf("null\n")
 			}
 		case "DUMP":
-            // The Data field contains the JSON representation of the entire store
 			data, _ := json.MarshalIndent(resp.Data, "", "  ")
 			fmt.Printf("%s\n", data)
 		case "SEARCH", "SEARCHKEY":
@@ -218,23 +214,17 @@ func (c *ClientContext) handleResponse(rawResp []byte) {
 	case "ERROR":
 		fmt.Printf("[ERROR] %s\n", resp.Message)
         
-	case "BROADCAST":
-        isSynchronous = false
-		fmt.Printf("\n[BROADCAST from %v] %s\n", resp.SenderId, resp.Message)
-        c.displayPrompt()
-        
 	default:
-        isSynchronous = false
+        // Handle STATUS messages or unexpected responses
         if resp.Status != "STATUS" {
 		    fmt.Printf("[STATUS: %s] %s\n", resp.Status, resp.Message)
         }
 	}
     
-    if isSynchronous {
-        select {
-        case c.responseChan <- true:
-        default:
-        }
+    // Always signal completion for a synchronous command
+    select {
+    case c.responseChan <- true:
+    default:
     }
 }
 
@@ -284,9 +274,8 @@ func processInput(input string, ctx *ClientContext) (Request, bool, bool) {
 		valueStr := strings.Join(parts[2:], " ")
 		
 		var value interface{}
-        // Attempt to unmarshal to maintain JSON integrity if possible
 		if err := json.Unmarshal([]byte(valueStr), &value); err != nil {
-            // Fallback: If it's not valid JSON, treat it as a raw string value.
+			// Fallback to raw string if not valid JSON
 			value = valueStr 
 		}
 		req.Key = key
@@ -299,9 +288,8 @@ func processInput(input string, ctx *ClientContext) (Request, bool, bool) {
 		}
 		req.Key = parts[1]
         
-        // If the user typed DUMPKEY, send a GET request to the server
         if op == "DUMPKEY" {
-            req.Op = "GET"
+            req.Op = "GET" // Map DUMPKEY command to server's GET operation
         }
         
 	case "SEARCH", "SEARCHKEY":
@@ -310,13 +298,6 @@ func processInput(input string, ctx *ClientContext) (Request, bool, bool) {
 			return req, false, false
 		}
 		req.Term = parts[1]
-        
-	case "BROADCAST":
-		if len(parts) < 2 {
-			fmt.Println("Usage: BROADCAST <message>")
-			return req, false, false
-		}
-		req.Message = strings.Join(parts[1:], " ")
         
 	case "SETID":
 		if len(parts) != 2 {
@@ -398,12 +379,10 @@ func main() {
 		}
 
 		if req.Op != "" {
-            // sendRequest ensures the Request struct is JSON marshaled before sending
 			ctx.sendRequest(req)
             
-            // BLOCK AND WAIT FOR THE SYNCHRONOUS RESPONSE
+            // Wait for the handleResponse goroutine to process the response
             if isServerCommand {
-                // Wait for the handleResponse goroutine to process the response
                 <-ctx.responseChan
             }
 		}

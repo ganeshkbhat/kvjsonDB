@@ -25,5 +25,6 @@
     "deletedAt": "0001-01-01T00:00:00Z",
     "email": "inactive@example.com",
     "username": "inactive_user"
-  }
+  },
+  "name": "names"
 }

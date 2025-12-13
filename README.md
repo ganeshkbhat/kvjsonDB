@@ -62,21 +62,59 @@ This document provides a comprehensive guide to running the `jsondb` executable 
 
 ## 1. DB Server Mode Startup Prefixes and Defaults
 
-To run the server, use the flag `-s db` or `--mode db`. The server strictly uses Mutual TLS (mTLS) for security.
+## 1. 🛠️ Server Command-Line Prefixes (`server.go` Flags)
 
-| Flag Short | Flag Long | Description | Default Value | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| `-s` | `--mode` | **Mode:** Defines the execution type. | `db` | Must be `db` for server. |
-| `-h` | `--host` | **Host:** The interface the server listens on. | `localhost` | Use `0.0.0.0` to listen on all interfaces. |
-| `-p` | `--port` | **Port:** The TCP port the server listens on. | `9999` | |
-| `-c` | `--cert` | **Server Certificate Path** | `server.crt` | Server's public certificate chain for mTLS. |
-| `-k` | `--key` | **Server Private Key Path** | `server.key` | Server's private key for mTLS. |
-| `-ca` | `--ca-cert` | **Root CA Certificate Path** | `ca.crt` | The CA used to sign both the server and client certificates. |
-| `-df` | `--dump-file` | **Data Dump File:** Filename for persistence of the main data store. | `store_dump.json` | |
-| `-sdf` | `--security-dump-file` | **Security Dump File:** Filename for persistence of Users, Groups, and ACLs. | `security_db_dump.json` | |
-| `-l` | `--load` | **Load File:** Initial file to load data from on startup. | Value of `--dump-file` | If not specified, loads from the current dump file. |
-| `-dt` | `--dump-time` | **Periodic Dump Interval:** Duration for automatically saving the store. | `30m` (30 minutes) | Set to `0s` to disable periodic dumping. |
-| `--log` | N/A | **Log File:** Path to the server log file. | `server.log` | Use `""` (empty string) to disable file logging. |
+These prefixes are used when running the `server.go` executable to configure its network, security, and persistence behavior.
+
+| Prefix (Short/Long) | Description | Default Value | Category |
+| :--- | :--- | :--- | :--- |
+| `-h`, `--host` | The interface the server listens on. | `localhost` | **Network** |
+| `-p`, `--port` | The TCP port the server listens on. | `9999` | **Network** |
+| `-c`, `--cert` | Server Certificate Path (for mTLS). | `server.crt` | **Security** |
+| `-k`, `--key` | Server Private Key Path (for mTLS). | `server.key` | **Security** |
+| `-ca`, `--ca-cert` | Root CA Certificate Path to verify clients. | `ca.crt` | **Security** |
+| `--dump-file` | Default filename for periodic and client-initiated data dumps. | `store_dump.json` | **Persistence** |
+| `--exit-dump-file` | Dedicated filename for the final dump upon graceful server shutdown. | (Defaults to `--dump-file`) | **Persistence** |
+| `-dt`, `--dump-time` | Duration for automatically saving the store (e.g., `5s`, `1m`). Set to `0s` to disable. | `5m` | **Persistence** |
+| `--load-file` | Filename to load data from at startup. | (Empty/Disabled) | **Initial Load** |
+
+---
+
+## 2. ⚡ Server Operations (Commands)
+
+These are the operations handled by the server's `handleRequest` function:
+
+1.  **`SET`**
+2.  **`GET`**
+3.  **`DELETE`**
+4.  **`SEARCH`** (or `SEARCHKEY`)
+5.  **`DUMP`**
+6.  **`DUMPTOFILE`**
+7.  **`LOAD`**
+8.  **`SETID`**
+
+---
+
+## 3. 🌐 Server API Structure (for Client Libraries)
+
+The server strictly communicates using JSON. Every client request must be a JSON object conforming to the **`Request`** structure, and every server response will be a JSON object conforming to the **`Response`** structure. All messages must be terminated with a newline (`\n`). 
+
+### A. Request Structure (`client -> server`)
+
+### A. Request Structure (`client -> server`)
+
+The base structure for the request is:
+
+```json
+{
+    "op": "string (REQUIRED)",
+    "key": "string (omitempty)",
+    "value": "interface{} (omitempty)",
+    "filename": "string (omitempty)",
+    "term": "interface{} (omitempty)",
+    "newId": "interface{} (omitempty)"
+}
+```
 
 ### Example Server Startup
 ```bash
@@ -112,8 +150,8 @@ To run the client shell, use the flag `-s shell` or `--mode shell`. The client r
 ```
 ## 3. Client Shell Commands (Extensive Guide)
 
-Once the shell is running and a connection is established, the following commands are available. The prompt format is: `[<User ID>@<Host:Port> : <Client CN>]>`.
-
+Once the shell is running and a connection is established, the following commands are available. The prompt format is: `jsondb>@<Host:Port>>`.
+<!-- 
 ### 🔐 Authentication & Authorization
 
 | Command | Usage | Description |
@@ -149,7 +187,7 @@ Permissions are defined by an integer: **0=NONE, 1=READ, 2=WRITE, 3=DELETE, 4=AD
 | `REMOVEPERM` | `REMOVEPERM <key> <user/group> <id>` | Removes the explicit permission entry for a user or group on a data key. |
 | `UPDATEACL` | `UPDATEACL <key> <default_perm 0-4>` | Sets the **default permission** for a data key. This is applied if no explicit user/group match is found. |
 | `VIEWACL` | `VIEWACL [key]` | View all keys that have explicit ACLs, or the details of the ACL for a specific key. |
-| `DELETEACL` | `DELETEACL <key>` | Removes the entire explicit ACL object associated with a data key. |
+| `DELETEACL` | `DELETEACL <key>` | Removes the entire explicit ACL object associated with a data key. | -->
 
 ### 📦 Key-Value Data Store Commands (Requires Token)
 
@@ -160,9 +198,9 @@ All data operations are subject to ACL checks based on the authenticated user's 
 | `SET` | `SET <key> <value/json>` | `WRITE` (2) | Sets a key with a simple string or a valid JSON structure. |
 | `GET` | `GET <key>` | `READ` (1) | Retrieves the value associated with a key. |
 | `DELETE` | `DELETE <key>` | `DELETE` (3) | Deletes a key-value entry. If it was a BLOB, the associated file is also removed. |
-| `PUTBLOB` | `PUTBLOB <key> <local_file_path>` | `WRITE` (2) | Stores the contents of the local file on the server, saving metadata in the key-value store. |
+<!-- | `PUTBLOB` | `PUTBLOB <key> <local_file_path>` | `WRITE` (2) | Stores the contents of the local file on the server, saving metadata in the key-value store. |
 | `GETBLOB` | `GETBLOB <key>` | `READ` (1) | Retrieves a BLOB and saves it to a local file named `retrieved_<key>_<originalName>`. |
-| `DELETEBLOB` | `DELETEBLOB <key>` | `DELETE` (3) | Explicitly deletes a BLOB key and its associated file. |
+| `DELETEBLOB` | `DELETEBLOB <key>` | `DELETE` (3) | Explicitly deletes a BLOB key and its associated file. | -->
 
 ### 🔎 Search & Bulk Delete (Requires Token)
 
@@ -170,17 +208,15 @@ All data operations are subject to ACL checks based on the authenticated user's 
 | :--- | :--- | :--- | :--- |
 | `SEARCH` | `SEARCH <string>` | `READ` (1) | Searches authorized keys and their values for a given string. |
 | `SEARCHKEY` | `SEARCHKEY <substring>` | `READ` (1) | Searches authorized keys only for a given substring. |
-| `DELETEKEY` | `DELETEKEY <substring>` | `DELETE` (3) | **DANGER:** Attempts to delete all keys containing the substring for which the user has `DELETE` permission. |
+<!-- | `DELETEKEY` | `DELETEKEY <substring>` | `DELETE` (3) | **DANGER:** Attempts to delete all keys containing the substring for which the user has `DELETE` permission. | -->
 
 ### ⚙️ System & Connection Commands (Local Shell Commands)
 
 | Command | Usage | Notes | Description |
 | :--- | :--- | :--- | :--- |
-| `CONNECT` | `CONNECT -h <host> -p <port> -ca <path> -c <path> -k <path>` | Optional flags | Disconnects the current session (if any) and attempts a new mTLS connection with the specified parameters, updating the shell's configuration. |
-| `DISCONNECT`| `DISCONNECT` | | Closes the current network connection and clears the session token. |
-| `MYADDRESS` | `MYADDRESS` | | Displays the **Server (Remote) Address** and the **Client (Local) Address** of the active connection. |
-| `CLIENTID` | `CLIENTID` | | Shows the Common Name (CN) from the client's mTLS certificate used for the current connection. |
-| `DUMP` | `DUMP [filename]` | Admin Required | Triggers the server to perform a persistence dump for both data and security stores. |
+| `MYADDR` | `MYADDR` | | Displays the **Server (Remote) Address** and the **Client (Local) Address** of the active connection. |
+| `DUMP` | `DUMPTOFILE [filename]` | Admin Required | Triggers the server to perform a persistence dump for both data and security stores. |
+| `DUMP` | `DUMP` | Admin Required | Triggers the server to perform a persistence dump for both data and security stores. |
 | `LOAD` | `LOAD <filename>` | Admin Required | Triggers the server to load data from the specified file (merging it) and reload the security store (overwriting it). |
 | `HELP` | `HELP` | | Displays the full list of shell commands. |
 | `EXIT` / `QUIT` | `EXIT` / `QUIT` | | Closes the shell application. |
@@ -192,21 +228,6 @@ All data operations are subject to ACL checks based on the authenticated user's 
 [certificates.sh](https://github.com/ganeshkbhat/kvjsonDB/blob/main/certificates.sh)
 
 
-# 💾 Security Database Persistence Changes
-
-The following outlines the necessary conceptual and implementation changes to ensure the security database (users, ACLs, groups, etc.) is reliably stored (persisted) even when the program exits or crashes.
-
-## 1. Security Persistence in Server Startup Flags (Reference)
-
-The `--security-dump-file` flag defines the persistence path. Data is loaded from and saved to this file.
-
-| Flag Short | Flag Long | Description | Default Value | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| `-sdf` | `--security-dump-file` | **Security Dump File:** Filename for persistence of Users, Groups, and ACLs. | `security_db_dump.json` | **Data is loaded from and saved to this file.** |
-
-## 2. Implementation Strategy Changes (High-Level Logic)
-
-To achieve reliable persistence, two primary mechanisms must be implemented in the server's code: a **Graceful Shutdown Handler** and an **Atomic Write Process**.
 
 ### A. Graceful Shutdown Handler
 

@@ -149,7 +149,6 @@ func loadData(filename string) error {
 	}
     
 	if _, err := os.Stat(filename); os.IsNotExist(err) {
-        // This is often expected, so only log as INFO/WARN during startup
 		return fmt.Errorf("file not found: %s", filename)
 	}
 
@@ -180,6 +179,16 @@ func saveData(filename string, opType string) error {
 	if targetFile == "" {
 		targetFile = *storeFile
 	}
+    
+    // Ensure we use exitDumpFile if it was specified for the final dump
+    if opType == "EXIT_DUMP" {
+        if *exitDumpFile != "" {
+            targetFile = *exitDumpFile
+        } else {
+            targetFile = *storeFile
+        }
+    }
+
 
 	data, err := json.MarshalIndent(dataStore, "", "  ")
 	if err != nil {
@@ -258,7 +267,6 @@ func handleRequest(clientID string, conn net.Conn, rawReq []byte) {
 		return
 	}
 	
-	// Log the incoming command request
 	op := strings.ToUpper(req.Op)
 	clientAddr := conn.RemoteAddr().String()
 	
@@ -351,18 +359,6 @@ func handleRequest(clientID string, conn net.Conn, rawReq []byte) {
 		
 		dataMutex.Lock() 
 
-	case "BROADCAST":
-		if req.Message == "" {
-			resp = newResponse("ERROR", op, "Missing message.", clientID, "", nil, nil)
-		} else {
-			sendResponse(conn, newResponse("OK", op, "Broadcast sent.", clientID, "", nil, nil)) 
-			
-			dataMutex.Unlock() 
-			broadcastMessage(clientID, req.Message)
-			dataMutex.Lock() 
-			return 
-		}
-        
 	case "SETID":
         newID := fmt.Sprintf("%v", req.NewID)
         
@@ -385,22 +381,6 @@ func handleRequest(clientID string, conn net.Conn, rawReq []byte) {
 	}
 
 	sendResponse(conn, resp)
-}
-
-// broadcastMessage sends a JSON broadcast message to all connected clients except the sender.
-func broadcastMessage(senderID string, message string) {
-	broadcastResp := newResponse("BROADCAST", "BROADCAST", message, senderID, "", nil, nil)
-	
-	dataMutex.RLock()
-	defer dataMutex.RUnlock()
-
-	accessLogger(LOG_ACTIVITY, "main.broadcastMessage", senderID, "BROADCAST_SEND", "", fmt.Sprintf("Sending message to %d clients.", len(clients)-1))
-
-	for clientID, clientConn := range clients {
-		if clientID != senderID {
-			go sendResponse(clientConn, broadcastResp)
-		}
-	}
 }
 
 // --- Connection Handler ---
@@ -443,18 +423,48 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+// --- Exit Dump Handler ---
+
+// handleExitDump is deferred in main() to ensure the data store is saved
+// regardless of how the main function exits (graceful, panic, os.Exit).
+func handleExitDump() {
+    // Detect if a panic occurred
+    if r := recover(); r != nil {
+        accessLogger(LOG_FATAL, "main.handleExitDump", "", "CRASH_DUMP", "", fmt.Sprintf("Panic detected: %v. Attempting final dump.", r))
+        // Re-panic after the dump is attempted
+        defer panic(r)
+    } else {
+        // This log executes if main returned normally (e.g., after receiving a signal)
+        accessLogger(LOG_INFO, "main.handleExitDump", "", "GRACEFUL_DUMP", "", "Main function exiting. Attempting final dump.")
+    }
+
+	// saveData will internally determine the correct dump file (--exit-dump-file or --dump-file)
+	// We use "EXIT_DUMP" as the opType to trigger the correct filename logic inside saveData.
+    if err := saveData("", "EXIT_DUMP"); err != nil {
+        accessLogger(LOG_FATAL, "main.handleExitDump", "", "EXIT_DUMP_FAIL", "", fmt.Sprintf("Failed final data dump: %v", err))
+    } else {
+        // Success logging is handled within saveData, but we confirm here.
+        accessLogger(LOG_INFO, "main.handleExitDump", "", "EXIT_SUCCESS", "", "Final data store dump confirmed.")
+    }
+
+    // Close all connections (This is primarily for a graceful signal, but good practice here)
+    dataMutex.Lock()
+    for _, conn := range clients {
+        conn.Close()
+    }
+    dataMutex.Unlock()
+}
+
+
 // --- Main Server Function ---
 
 func main() {
+    // DEFER MUST BE THE FIRST THING: Ensures handleExitDump runs when main exits (crash or return)
+    defer handleExitDump()
+    
 	setupFlags()
 	
 	accessLogger(LOG_INFO, "main.main", "", "SERVER_START", "", fmt.Sprintf("Server starting on %s:%s...", *host, *port))
-
-    // Set the file path for the graceful shutdown dump. Default to --dump-file.
-    finalDumpFile := *exitDumpFile
-    if finalDumpFile == "" {
-        finalDumpFile = *storeFile
-    }
 
     // --- Signal Handling for Graceful Exit ---
     sigChan := make(chan os.Signal, 1)
@@ -462,22 +472,9 @@ func main() {
 
     go func() {
         sig := <-sigChan
-        accessLogger(LOG_WARN, "main.signalHandler", "", "GRACEFUL_EXIT", finalDumpFile, fmt.Sprintf("Received signal %v. Initiating shutdown.", sig))
+        accessLogger(LOG_WARN, "main.signalHandler", "", "GRACEFUL_EXIT", "", fmt.Sprintf("Received signal %v. Initiating shutdown.", sig))
 
-        // Perform final dump using the determined exit file
-		// Use "EXIT_DUMP" as the operation type for logging
-        if err := saveData(finalDumpFile, "EXIT_DUMP"); err != nil {
-            accessLogger(LOG_FATAL, "main.signalHandler", "", "EXIT_DUMP_FAIL", finalDumpFile, fmt.Sprintf("Failed final data dump: %v", err))
-        } else {
-            accessLogger(LOG_INFO, "main.signalHandler", "", "EXIT_SUCCESS", finalDumpFile, "Final data store dumped. Shutting down.")
-        }
-
-        dataMutex.Lock()
-        for _, conn := range clients {
-            conn.Close()
-        }
-        dataMutex.Unlock()
-
+        // Simply exit the process. The deferred handleExitDump will execute the save.
         os.Exit(0)
     }()
     // --------------------------------------------------
@@ -486,7 +483,6 @@ func main() {
 	if *loadFile != "" {
 		dataMutex.Lock()
 		if err := loadData(*loadFile); err != nil { 
-			// Load failure handled within loadData log, here we just check for the error type
 			accessLogger(LOG_WARN, "main.main", "", "INIT_LOAD", *loadFile, fmt.Sprintf("Initial load error: %v.", err))
 		}
 		dataMutex.Unlock()
@@ -540,4 +536,7 @@ func main() {
 		}
 		go handleConnection(conn)
 	}
+    
+    // Note: main will only reach here if the listener.Accept loop somehow terminates without an os.Exit.
+    // The deferred handleExitDump will capture this return path too.
 }

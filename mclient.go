@@ -27,12 +27,15 @@ var (
 // ClientContext holds necessary data for the shell
 type ClientContext struct {
 	ClientSocket *tls.Conn
-	ClientID     string // Server assigned ID (e.g., 1:127.0.0.1:54321)
-	RemoteAddr   string // Server address (e.g., localhost:9999)
+	ClientID     string 
+	RemoteAddr   string 
 	Scanner      *bufio.Scanner
+    
+    // Channel to synchronize synchronous command responses
+    responseChan chan bool 
 }
 
-// Request structure (matches server's Request struct)
+// Request structure (The data sent must conform to this JSON structure)
 type Request struct {
 	Op       string      `json:"op"`
 	Key      string      `json:"key,omitempty"`
@@ -43,7 +46,7 @@ type Request struct {
 	NewID    interface{} `json:"newId,omitempty"`
 }
 
-// Response structure (matches server's Response struct)
+// Response structure (The data received will always conform to this JSON structure)
 type Response struct {
 	Status   string      `json:"status"`
 	Op       string      `json:"op,omitempty"`
@@ -105,32 +108,31 @@ func connectToServer() *ClientContext {
 		ClientID:     "N/A", 
 		RemoteAddr:   addr,
 		Scanner:      bufio.NewScanner(os.Stdin),
+        responseChan: make(chan bool, 1),
 	}
 }
 
 // --- Blocking ID Acquisition ---
 
-// acquireClientID blocks until the first response (STATUS) is received and processed.
 func acquireClientID(ctx *ClientContext) error {
 	reader := bufio.NewReader(ctx.ClientSocket)
     
-    // Set a timeout for reading the initial response (e.g., 5 seconds)
     ctx.ClientSocket.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	rawResp, err := reader.ReadBytes('\n')
 	if err != nil {
-        ctx.ClientSocket.SetReadDeadline(time.Time{}) // Clear deadline
+        ctx.ClientSocket.SetReadDeadline(time.Time{})
 		return fmt.Errorf("error reading initial server response: %w", err)
 	}
     
-    ctx.ClientSocket.SetReadDeadline(time.Time{}) // Clear deadline
+    ctx.ClientSocket.SetReadDeadline(time.Time{})
 
 	var resp Response
+    // Enforce JSON structure on initial response
 	if err := json.Unmarshal(rawResp, &resp); err != nil {
 		return fmt.Errorf("invalid JSON in initial server response: %w", err)
 	}
 
-	// CRITICAL: Check for the expected STATUS message
 	if resp.Status == "STATUS" && resp.SenderId != nil {
 		if idStr, ok := resp.SenderId.(string); ok && idStr != "" {
 			ctx.ClientID = idStr
@@ -144,150 +146,207 @@ func acquireClientID(ctx *ClientContext) error {
 
 // --- Prompt Handling ---
 
-// displayPrompt constructs and displays the shell prompt (jsondb@ServerHost:ServerPort>)
 func (c *ClientContext) displayPrompt() {
-	// CHANGED: Simplified prompt to show only the server address
 	fmt.Printf("jsondb@%s> ", c.RemoteAddr)
 }
 
 // --- Communication ---
 
+// sendRequest marshals the Request struct to JSON and sends it.
 func (c *ClientContext) sendRequest(req Request) {
 	data, err := json.Marshal(req)
 	if err != nil {
 		log.Println("Error marshaling request:", err)
 		return
 	}
+    // All client output is a single JSON structure followed by a newline.
 	c.ClientSocket.Write(append(data, '\n'))
 }
 
 // handleResponse parses and displays the server's JSON response
 func (c *ClientContext) handleResponse(rawResp []byte) {
 	var resp Response
+    // Enforce JSON structure on all incoming responses
 	if err := json.Unmarshal(rawResp, &resp); err != nil {
-		fmt.Printf(" [Server] Invalid JSON response: %s\n", rawResp)
+		fmt.Printf("\n [Server] Invalid JSON response: %s\n", rawResp)
+        select {
+        case c.responseChan <- true:
+        default:
+        }
 		return
 	}
     
-    // If the ID is updated via SETID, update ctx.ClientID
     if resp.SenderId != nil {
         if idStr, ok := resp.SenderId.(string); ok && idStr != "" {
             c.ClientID = idStr
         }
     }
+    
+    isSynchronous := true
 
-	// Print the server response based on status
 	switch resp.Status {
 	case "OK":
-		if resp.Op == "GET" {
-			fmt.Printf(" [OK] Key: %s, Value: %v\n", resp.Key, resp.Value)
-		} else if resp.Op == "DUMP" {
+		switch resp.Op {
+		case "GET":
+			// Output GET data prettily
+			if resp.Value != nil {
+				// The value is guaranteed to be a valid JSON type (string, number, map, array, null)
+				data, _ := json.MarshalIndent(resp.Value, "", "  ")
+				fmt.Printf("%s\n", data)
+			} else {
+				fmt.Printf("null\n")
+			}
+		case "DUMP":
+            // The Data field contains the JSON representation of the entire store
 			data, _ := json.MarshalIndent(resp.Data, "", "  ")
-			fmt.Printf(" [OK] Full Store Dump:\n%s\n", data)
-		} else if resp.Results != nil {
+			fmt.Printf("%s\n", data)
+		case "SEARCH", "SEARCHKEY":
 			if resMap, ok := resp.Results.(map[string]interface{}); ok && len(resMap) > 0 {
 				results, _ := json.MarshalIndent(resMap, "", "  ")
-				fmt.Printf(" [OK] Search Results:\n%s\n", results)
+				fmt.Printf("%s\n", results)
 			} else {
-				fmt.Printf(" [OK] Search completed, 0 results.\n")
+				fmt.Printf("Search completed, 0 results.\n")
 			}
-		} else {
-			fmt.Printf(" [OK] %s\n", resp.Message)
+        case "DUMPTOFILE", "SETID", "LOAD", "INIT":
+            if resp.Message != "" {
+                fmt.Printf("[INFO] %s\n", resp.Message)
+            }
 		}
+
 	case "NOT_FOUND":
-		fmt.Printf(" [NOT FOUND] Key: %s\n", resp.Key)
+		fmt.Printf("[ERROR] Key not found: %s\n", resp.Key)
 	case "ERROR":
-		fmt.Printf(" [ERROR] %s\n", resp.Message)
+		fmt.Printf("[ERROR] %s\n", resp.Message)
+        
 	case "BROADCAST":
+        isSynchronous = false
 		fmt.Printf("\n[BROADCAST from %v] %s\n", resp.SenderId, resp.Message)
+        c.displayPrompt()
+        
 	default:
-        // Don't print the initial STATUS message, but log other unhandled statuses
+        isSynchronous = false
         if resp.Status != "STATUS" {
-		    fmt.Printf(" [STATUS: %s] %s\n", resp.Status, resp.Message)
+		    fmt.Printf("[STATUS: %s] %s\n", resp.Status, resp.Message)
         }
 	}
+    
+    if isSynchronous {
+        select {
+        case c.responseChan <- true:
+        default:
+        }
+    }
 }
 
-// processInput handles command parsing from stdin
-func processInput(input string, ctx *ClientContext) (Request, bool) {
+// processInput handles command parsing from stdin and constructs the JSON Request
+func processInput(input string, ctx *ClientContext) (Request, bool, bool) {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
-		return Request{}, false
+		return Request{}, false, false
 	}
 
 	op := strings.ToUpper(parts[0])
 	req := Request{Op: op}
+    
+    isServerCommand := true
 
 	switch op {
 	case "EXIT", "QUIT":
-		return req, true 
+        isServerCommand = false
+		return req, true, false
 	case "MYADDR":
-		// RE-ADDED: Client-side command to display connection details
+        isServerCommand = false
 		fmt.Printf("Client ID: %s\n", ctx.ClientID)
 		
 		idParts := strings.Split(ctx.ClientID, ":")
 		if ctx.ClientID == "N/A" {
 			fmt.Printf("  Status: ID not yet received from server.\n")
 		} else if len(idParts) >= 3 {
-            // Server ID format is typically N:IP:PORT or NAME:IP:PORT
 			idPart := idParts[0]
 			ipPart := idParts[len(idParts)-2]
 			portPart := idParts[len(idParts)-1]
             
-            // Format output as requested
 			fmt.Printf("  clientid > %s\n", idPart)
 			fmt.Printf("  clientip > %s\n", ipPart)
 			fmt.Printf("  clientport > %s\n", portPart)
 		} else {
 			fmt.Printf("  Status: ID received, but format is irregular: %s\n", ctx.ClientID)
 		}
-		return Request{}, false // Do not send anything to the server
+        fmt.Println() 
+		return Request{}, false, false
+
 	case "SET":
 		if len(parts) < 3 {
 			fmt.Println("Usage: SET <key> <value_in_json_format>")
-			return req, false
+			return req, false, false
 		}
 		key := parts[1]
 		valueStr := strings.Join(parts[2:], " ")
 		
 		var value interface{}
+        // Attempt to unmarshal to maintain JSON integrity if possible
 		if err := json.Unmarshal([]byte(valueStr), &value); err != nil {
-			value = valueStr
+            // Fallback: If it's not valid JSON, treat it as a raw string value.
+			value = valueStr 
 		}
 		req.Key = key
 		req.Value = value
-	case "GET", "DELETE":
+        
+	case "GET", "DELETE", "DUMPKEY": 
 		if len(parts) != 2 {
 			fmt.Printf("Usage: %s <key>\n", op)
-			return req, false
+			return req, false, false
 		}
 		req.Key = parts[1]
+        
+        // If the user typed DUMPKEY, send a GET request to the server
+        if op == "DUMPKEY" {
+            req.Op = "GET"
+        }
+        
 	case "SEARCH", "SEARCHKEY":
 		if len(parts) != 2 {
 			fmt.Printf("Usage: %s <search_term>\n", op)
-			return req, false
+			return req, false, false
 		}
 		req.Term = parts[1]
+        
 	case "BROADCAST":
 		if len(parts) < 2 {
 			fmt.Println("Usage: BROADCAST <message>")
-			return req, false
+			return req, false, false
 		}
 		req.Message = strings.Join(parts[1:], " ")
+        
 	case "SETID":
 		if len(parts) != 2 {
 			fmt.Println("Usage: SETID <new_name>")
-			return req, false
+			return req, false, false
 		}
 		req.NewID = parts[1]
+    
+    case "LOAD":
+        if len(parts) != 2 {
+            fmt.Println("Usage: LOAD <filename>")
+            return req, false, false
+        }
+        req.Filename = parts[1]
+        
     case "DUMP", "DUMPTOFILE":
-        // DUMP and DUMPTOFILE need no further arguments
+        if op == "DUMPTOFILE" && len(parts) > 1 {
+            req.Filename = parts[1]
+        } else if len(parts) != 1 && op == "DUMP" {
+            fmt.Println("Usage: DUMP (no arguments)")
+            return req, false, false
+        }
+    
 	default:
+        isServerCommand = false
 		fmt.Printf("Unknown operation: %s\n", op)
-		return req, false
+		return Request{}, false, false
 	}
 
-	return req, false
+	return req, false, isServerCommand
 }
 
 // --- Main Loop ---
@@ -301,7 +360,6 @@ func main() {
 
     fmt.Printf("Connected securely to %s. Waiting for initial ID...\n", ctx.RemoteAddr)
     
-    // BLOCKING CALL: Acquire the client ID before starting the interactive loop.
     if err := acquireClientID(ctx); err != nil {
         log.Fatalf("Failed to synchronize ClientID with server: %v", err)
     }
@@ -317,18 +375,12 @@ func main() {
 				return
 			}
 			
-			// Process all incoming responses (including broadcasts and SETID confirmations)
 			ctx.handleResponse(rawResp)
-
-			// Redisplay prompt after async response like BROADCAST or SETID
-			if strings.Contains(string(rawResp), `"BROADCAST"`) || strings.Contains(string(rawResp), `"SETID"`) {
-				ctx.displayPrompt()
-			}
 		}
 	}()
     
     log.Println("ID synchronization complete. Starting shell.")
-
+    
 	// Main client input loop
 	for {
 		ctx.displayPrompt() 
@@ -338,7 +390,7 @@ func main() {
 		}
 		
 		input := ctx.Scanner.Text()
-		req, shouldQuit := processInput(input, ctx) 
+		req, shouldQuit, isServerCommand := processInput(input, ctx) 
 
 		if shouldQuit {
 			fmt.Println("Exiting client.")
@@ -346,7 +398,14 @@ func main() {
 		}
 
 		if req.Op != "" {
+            // sendRequest ensures the Request struct is JSON marshaled before sending
 			ctx.sendRequest(req)
+            
+            // BLOCK AND WAIT FOR THE SYNCHRONOUS RESPONSE
+            if isServerCommand {
+                // Wait for the handleResponse goroutine to process the response
+                <-ctx.responseChan
+            }
 		}
 	}
 }

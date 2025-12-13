@@ -10,542 +10,532 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-// --- Configuration Variables (Parsed by 'flag') ---
+// --- Log Type Constants ---
+const (
+	LOG_INFO    = "INFO"
+	LOG_ERROR   = "ERROR"
+	LOG_WARN    = "WARN"
+	LOG_ACTIVITY = "ACCESS"
+	LOG_FATAL   = "FATAL"
+)
+
+// --- Configuration Variables (Server Flags) ---
 var (
-	// Server/Network (Short flags: -h, -p)
+	// Network
 	host *string
 	port *string
-	// Security (mTLS) (Short flags: -c, -k, -ca)
+	// Security (mTLS)
 	certFile *string
 	keyFile  *string
 	clientCA *string
-	// Data Persistence (Short flag: -dt)
-	dumpFile        *string
-	dumpIntervalStr *string
+	// Persistence
+	storeFile    *string    // Default for client DUMPTOFILE and periodic dump
+	exitDumpFile *string    // Dedicated file for final graceful exit
+	dumpTimeStr *string
+    // Initial Load
+    loadFile    *string 
 )
 
-// --- Global State ---
+// Global State
 var (
-	// clientIdCounter tracks simple sequential ID for new connections
-	clientIdCounter int 
-	// activeClients now uses string ID for the client identifier
-	activeClients   = make(map[string]*ClientConnection) 
-	clientsMutex    sync.Mutex // Protects activeClients and clientIdCounter
+	dataStore       = make(map[string]interface{})
+	dataMutex       sync.RWMutex
+	clientIDCounter int64 = 0
+    clients         = make(map[string]net.Conn) 
 )
 
-// --- Structures ---
-
-// ClientConnection wraps the socket and ID
-type ClientConnection struct {
-	Socket net.Conn
-	ID     string // ID is now a formatted string (id:ip:port)
-}
-
-// Request represents the incoming JSON command
+// Request structure (The input must conform to this JSON structure)
 type Request struct {
-	Op       string                 `json:"op"`
-	Key      string                 `json:"key,omitempty"`
-	Value    interface{}            `json:"value,omitempty"` // For SET
-	Data     map[string]interface{} `json:"data,omitempty"`  // For LOAD/INIT
-	Filename string                 `json:"filename,omitempty"`
-	Term     interface{}            `json:"term,omitempty"` // For SEARCH
-	Message  string                 `json:"message,omitempty"`
-	NewID    interface{}            `json:"newId,omitempty"`
+	Op       string      `json:"op"`
+	Key      string      `json:"key,omitempty"`
+	Value    interface{} `json:"value,omitempty"`
+	Filename string      `json:"filename,omitempty"` 
+	Term     interface{} `json:"term,omitempty"`
+	Message  string      `json:"message,omitempty"`
+	NewID    interface{} `json:"newId,omitempty"`
 }
 
-// Response represents the outgoing JSON
+// Response structure (The output will always conform to this JSON structure)
 type Response struct {
 	Status   string      `json:"status"`
 	Op       string      `json:"op,omitempty"`
 	Message  string      `json:"message,omitempty"`
 	Key      string      `json:"key,omitempty"`
 	Value    interface{} `json:"value,omitempty"`
-	SenderId interface{} `json:"senderId,omitempty"` // Kept as interface{} for compatibility but will hold a string
-	Results  interface{} `json:"results,omitempty"`
+	SenderId interface{} `json:"senderId,omitempty"`
+	Results  interface{} `json:"results,omitempty"` 
 	Data     interface{} `json:"data,omitempty"`
 	Time     string      `json:"timestamp,omitempty"`
 }
 
-// KeyValueStore handles data locking and operations
-type KeyValueStore struct {
-	Data map[string]interface{}
-	Lock sync.RWMutex // Global lock for the map (Go maps are not safe for concurrent use)
-}
+// --- Structured Logger ---
 
-var store = KeyValueStore{
-	Data: make(map[string]interface{}),
-}
-
-// --- Client Management ---
-
-func NewClientConnection(conn net.Conn) *ClientConnection {
-	clientsMutex.Lock()
-	defer clientsMutex.Unlock()
-
-	clientIdCounter++
+// accessLogger provides an Apache-like log format with extra structure.
+func accessLogger(logType, fileFunc, clientAddr, operation, key, message string) {
+	// Derive server address from flags
+	serverAddr := fmt.Sprintf("%s:%s", *host, *port)
     
-    // EXTRACT IP AND PORT
-	remoteAddr := conn.RemoteAddr().String()
-    host, port, err := net.SplitHostPort(remoteAddr)
-    if err != nil {
-        log.Printf("Error splitting host/port for %s: %v. Using address directly.", remoteAddr, err)
-        host = remoteAddr
-        port = "unknown"
+    // Default the client address if not provided (e.g., for internal server actions)
+    if clientAddr == "" {
+        clientAddr = "INTERNAL"
     }
 
-	// Format the new client ID string
-	newID := fmt.Sprintf("%d:%s:%s", clientIdCounter, host, port)
-
-	client := &ClientConnection{
-		Socket: conn,
-		ID:     newID,
-	}
-	// Use the formatted string ID as the map key
-	activeClients[client.ID] = client 
-    
-    // Server logs the connection
-	log.Printf("Client %s: CONNECTED", client.ID) 
-	return client
+	logMsg := fmt.Sprintf(
+		"| %-6s | %s | S:%s | C:%-20s | %-25s | %-12s | KEY:%-15s | %s",
+		logType,
+		time.Now().Format("2006-01-02 15:04:05"),
+		serverAddr,
+		clientAddr,
+		fileFunc,
+		operation,
+		key,
+		message,
+	)
+	log.Println(logMsg)
 }
 
-func (c *ClientConnection) SetClientID(newID interface{}) bool {
-	idStr, ok := newID.(string)
-	if !ok || idStr == "" {
-		return false
-	}
-    
-    // OPTIONAL: Prepend the existing network address to the user-defined ID
-    // Find the network part of the current ID (e.g., ":127.0.0.1:55000")
-    parts := strings.Split(c.ID, ":")
-    networkSuffix := ""
-    if len(parts) >= 3 {
-        networkSuffix = fmt.Sprintf(":%s:%s", parts[len(parts)-2], parts[len(parts)-1])
-    }
+// --- Initialization and Flags ---
 
-    finalNewID := idStr + networkSuffix
+func setupFlags() {
+	// Network Flags
+	host = flag.String("h", "localhost", "Host (long: --host): The interface the server listens on (default: localhost).")
+	flag.StringVar(host, "host", "localhost", "Host (short: -h): The interface the server listens on (default: localhost).")
+	port = flag.String("p", "9999", "Port (long: --port): The TCP port the server listens on.")
+	flag.StringVar(port, "port", "9999", "Port (short: -p): The TCP port the server listens on.")
 
-	clientsMutex.Lock()
-	defer clientsMutex.Unlock()
+	// Security (mTLS) Flags
+	certFile = flag.String("c", "server.crt", "Server Cert Path (long: --cert).")
+	flag.StringVar(certFile, "cert", "server.crt", "Server Cert Path (short: -c).")
+	keyFile = flag.String("k", "server.key", "Server Private Key Path (long: --key).")
+	flag.StringVar(keyFile, "key", "server.key", "Server Private Key Path (short: -k).")
+	
+    // Client CA Flags (handling both short and long forms)
+	clientCA = flag.String("ca", "ca.crt", "Root CA Cert Path (long: --ca-cert) to verify clients.")
+	flag.StringVar(clientCA, "ca-cert", "ca.crt", "Root CA Certificate Path (short: -ca) to verify clients.")
 
-	// Delete old reference (using the old formatted ID string)
-	delete(activeClients, c.ID)
+	// Persistence Flags
+    storeFile = flag.String("dump-file", "store_dump.json", "Data Dump File: Default filename for periodic persistence and client DUMPTOFILE operations.")
+	
+    exitDumpFile = flag.String("exit-dump-file", "", "Graceful Exit Dump File: Dedicated filename for the final dump upon server shutdown. Defaults to the value of --dump-file if not set.")
+
+	dumpTimeStr = flag.String("dt", "5m", "Periodic Dump Interval (long: --dump-time): Duration for automatically saving the store (e.g., 5s, 1m, 30m). Set to 0s to disable.")
+	flag.StringVar(dumpTimeStr, "dump-time", "5m", "Periodic Dump Interval (short: -dt): Duration for automatically saving the store (e.g., 5s, 1m, 30m). Set to 0s to disable.")
     
-	// Update ID
-	c.ID = finalNewID
+    // Initial Load Flag
+    loadFile = flag.String("load-file", "", "Initial Load File: Filename to load data from at startup. Leave empty to skip loading.")
+
+	flag.Parse()
     
-	// Add new reference (using the new formatted ID string)
-	activeClients[c.ID] = c
-	log.Printf("Client ID updated to: %v", c.ID)
-	return true
+    // Override standard log format to avoid duplication
+    log.SetFlags(0)
+    
+    accessLogger(LOG_INFO, "main.setupFlags", "", "INIT_CONFIG", "", "Flags parsed successfully.")
 }
 
-func (c *ClientConnection) WriteJSON(v interface{}) {
-	data, err := json.Marshal(v)
+// --- Server Helpers (Database Operations) ---
+
+// loadData attempts to load the data store from the given file.
+func loadData(filename string) error {
+	if filename == "" {
+        accessLogger(LOG_ERROR, "main.loadData", "", "LOAD_FAIL", "", "Filename cannot be empty.")
+		return fmt.Errorf("filename cannot be empty")
+	}
+    
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+        // This is often expected, so only log as INFO/WARN during startup
+		return fmt.Errorf("file not found: %s", filename)
+	}
+
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		log.Println("Error marshaling JSON:", err)
-		return
+        accessLogger(LOG_ERROR, "main.loadData", "", "LOAD_FAIL", filename, fmt.Sprintf("Failed to read file: %v", err))
+		return fmt.Errorf("failed to read load file %s: %w", filename, err)
 	}
-	// Append newline as delimiter
-	c.Socket.Write(append(data, '\n'))
-}
-
-func (c *ClientConnection) Close() {
-	clientsMutex.Lock()
-	// Use the formatted string ID as the map key
-	delete(activeClients, c.ID) 
-	clientsMutex.Unlock()
-	// Log client disconnection
-	log.Printf("Client %v: DISCONNECT", c.ID)
-	c.Socket.Close()
-}
-
-// --- Broadcast Logic (No Changes) ---
-
-func broadcastMessage(senderID interface{}, message string) int {
-	timestamp := time.Now().Format(time.RFC3339)
-	payload := Response{
-		Status:   "BROADCAST",
-		SenderId: senderID,
-		Message:  message,
-		Time:     timestamp,
+    
+    var tempStore = make(map[string]interface{})
+	if err := json.Unmarshal(data, &tempStore); err != nil {
+        accessLogger(LOG_ERROR, "main.loadData", "", "LOAD_FAIL", filename, fmt.Sprintf("Failed to unmarshal JSON: %v", err))
+		return fmt.Errorf("failed to unmarshal JSON from %s: %w", filename, err)
 	}
 
-	clientsMutex.Lock()
-	defer clientsMutex.Unlock()
-
-	recipients := 0
-	// Map key is now guaranteed to be string
-	senderIDStr, _ := senderID.(string) 
-
-	for id, client := range activeClients {
-		if id != senderIDStr {
-			client.WriteJSON(payload)
-			recipients++
-		}
-	}
-	log.Printf("[Broadcast] Message from Client %v to %d others.", senderID, recipients)
-	return recipients
+    dataStore = tempStore
+    accessLogger(LOG_INFO, "main.loadData", "", "LOAD_SUCCESS", filename, fmt.Sprintf("Successfully loaded %d keys.", len(dataStore)))
+	return nil
 }
 
-// --- Store Logic (No Changes) ---
+// saveData saves the current data store to the specified or default dump file.
+func saveData(filename string, opType string) error {
+	dataMutex.RLock()
+	defer dataMutex.RUnlock()
 
-func (s *KeyValueStore) LoadData(newData map[string]interface{}) {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	for k, v := range newData {
-		s.Data[k] = v
+	// If no filename is provided (periodic/exit dump), use the default --dump-file.
+	targetFile := filename
+	if targetFile == "" {
+		targetFile = *storeFile
 	}
-}
 
-func (s *KeyValueStore) InitializeData(newData map[string]interface{}) {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	s.Data = make(map[string]interface{}) // Reset
-	if newData != nil {
-		for k, v := range newData {
-			s.Data[k] = v
-		}
-	}
-}
-
-func (s *KeyValueStore) DumpToFile(filename string) Response {
-	s.Lock.RLock()
-	defer s.Lock.RUnlock()
-
-	fileData, err := json.MarshalIndent(s.Data, "", "  ")
+	data, err := json.MarshalIndent(dataStore, "", "  ")
 	if err != nil {
-		return Response{Status: "ERROR", Op: "DUMPTOFILE", Message: err.Error()}
+        accessLogger(LOG_ERROR, "main.saveData", "", opType, targetFile, fmt.Sprintf("Failed to marshal data: %v", err))
+		return fmt.Errorf("failed to marshal data: %w", err)
 	}
 
-	err = os.WriteFile(filename, fileData, 0644)
-	if err != nil {
-		log.Println("Error writing dump file:", err)
-		return Response{Status: "ERROR", Op: "DUMPTOFILE", Message: "Failed to write file: " + err.Error()}
+	if err := os.WriteFile(targetFile, data, 0644); err != nil {
+        accessLogger(LOG_ERROR, "main.saveData", "", opType, targetFile, fmt.Sprintf("Failed to write file: %v", err))
+		return fmt.Errorf("failed to write data to %s: %w", targetFile, err)
 	}
-
-	return Response{Status: "OK", Op: "DUMPTOFILE", Message: "Data successfully written to " + filename}
+    accessLogger(LOG_INFO, "main.saveData", "", opType, targetFile, fmt.Sprintf("Data dumped successfully. Key count: %d", len(dataStore)))
+	return nil
 }
 
-// --- Periodic Dump Logic (No Changes) ---
-
+// startPeriodicDump starts a ticker to save the data periodically.
 func startPeriodicDump() {
-	// Parse the string duration from the flag
-	interval, err := time.ParseDuration(*dumpIntervalStr)
+	duration, err := time.ParseDuration(*dumpTimeStr)
 	if err != nil {
-		log.Fatalf("Invalid dump-time format '%s': %v", *dumpIntervalStr, err)
+		accessLogger(LOG_FATAL, "main.startPeriodicDump", "", "DUMP_CONFIG", *dumpTimeStr, fmt.Sprintf("Invalid dump-time duration: %v", err))
+		log.Fatalf("Invalid dump-time duration %s: %v", *dumpTimeStr, err)
 	}
 
-	if interval <= 0 {
-		log.Println("Periodic dumping disabled.")
+	if duration <= 0 {
+		accessLogger(LOG_INFO, "main.startPeriodicDump", "", "DUMP_CONFIG", "", "Periodic dumping disabled.")
 		return
 	}
 
-	log.Printf("Starting periodic dump every %s to %s", interval, *dumpFile)
+	ticker := time.NewTicker(duration)
+	accessLogger(LOG_INFO, "main.startPeriodicDump", "", "DUMP_CONFIG", *storeFile, fmt.Sprintf("Periodic dumping started every %s.", duration))
 
-	ticker := time.NewTicker(interval)
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
-				log.Printf("Scheduled dump triggered.")
-				// Use the dumpFile pointer value
-				resp := store.DumpToFile(*dumpFile) 
-				if resp.Status != "OK" {
-					log.Printf("Scheduled dump FAILED: %s", resp.Message)
-				} else {
-					log.Println("Scheduled dump successful.")
+				// Use "PERIODIC_DUMP" as the operation type for logging
+				if err := saveData("", "PERIODIC_DUMP"); err != nil { 
+					accessLogger(LOG_ERROR, "main.startPeriodicDump", "", "PERIODIC_DUMP_FAIL", *storeFile, fmt.Sprintf("Periodic dump failed: %v", err))
 				}
 			}
 		}
 	}()
+}
+
+// --- Server Helpers (Response Handling) (UNCHANGED) ---
+
+func newResponse(status string, op string, message string, senderID string, key string, value interface{}, results interface{}) Response {
+	return Response{
+		Status:   status,
+		Op:       op,
+		Message:  message,
+		SenderId: senderID,
+		Key:      key,
+		Value:    value,
+		Results:  results,
+		Time:     time.Now().Format(time.RFC3339),
+	}
+}
+
+func sendResponse(conn net.Conn, resp Response) {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		accessLogger(LOG_ERROR, "main.sendResponse", conn.RemoteAddr().String(), resp.Op, resp.Key, fmt.Sprintf("Error marshaling response: %v", err))
+		return
+	}
+	conn.Write(append(data, '\n'))
+}
+
+// --- Core Request Handling ---
+
+func handleRequest(clientID string, conn net.Conn, rawReq []byte) {
+	var req Request
+	if err := json.Unmarshal(rawReq, &req); err != nil {
+		sendResponse(conn, newResponse("ERROR", "", "Invalid JSON request.", clientID, "", nil, nil))
+		accessLogger(LOG_ERROR, "main.handleRequest", conn.RemoteAddr().String(), "RECV_REQUEST", "", fmt.Sprintf("Invalid JSON received: %s", string(rawReq)))
+		return
+	}
+	
+	// Log the incoming command request
+	op := strings.ToUpper(req.Op)
+	clientAddr := conn.RemoteAddr().String()
+	
+	accessLogger(LOG_ACTIVITY, "main.handleRequest", clientAddr, op, req.Key, fmt.Sprintf("Request received. ClientID: %s", clientID))
+
+
+	var resp Response
+
+	dataMutex.Lock()
+	defer dataMutex.Unlock()
+	
+	switch op {
+	case "SET":
+		if req.Key == "" || req.Value == nil {
+			resp = newResponse("ERROR", op, "Missing key or value.", clientID, "", nil, nil)
+		} else {
+			dataStore[req.Key] = req.Value
+			resp = newResponse("OK", op, "Key set successfully.", clientID, req.Key, nil, nil)
+		}
+	case "GET":
+		if req.Key == "" {
+			resp = newResponse("ERROR", op, "Missing key.", clientID, "", nil, nil)
+		} else if val, ok := dataStore[req.Key]; ok {
+			resp = newResponse("OK", op, "Key retrieved successfully.", clientID, req.Key, val, nil)
+		} else {
+			resp = newResponse("NOT_FOUND", op, "Key not found.", clientID, req.Key, nil, nil)
+		}
+	case "DELETE":
+		if req.Key == "" {
+			resp = newResponse("ERROR", op, "Missing key.", clientID, "", nil, nil)
+		} else if _, ok := dataStore[req.Key]; ok {
+			delete(dataStore, req.Key)
+			resp = newResponse("OK", op, "Key deleted successfully.", clientID, req.Key, nil, nil)
+		} else {
+			resp = newResponse("NOT_FOUND", op, "Key not found.", clientID, req.Key, nil, nil)
+		}
+	case "SEARCH", "SEARCHKEY":
+		results := make(map[string]interface{})
+		termStr := fmt.Sprintf("%v", req.Term)
+		
+		for k, v := range dataStore {
+			vStr := fmt.Sprintf("%v", v)
+			if strings.Contains(strings.ToLower(k), strings.ToLower(termStr)) || strings.Contains(strings.ToLower(vStr), strings.ToLower(termStr)) {
+				results[k] = v
+			}
+		}
+		
+		resp = newResponse("OK", op, fmt.Sprintf("Search completed. Found %d results.", len(results)), clientID, "", nil, results)
+
+	case "DUMP":
+		dataMutex.Unlock() 
+		
+		respData, _ := json.Marshal(dataStore)
+		var temp interface{}
+		json.Unmarshal(respData, &temp)
+		
+		dataMutex.Lock() 
+		
+		resp = newResponse("OK", op, "Data dump retrieved.", clientID, "", nil, nil)
+		resp.Data = temp
+
+	case "DUMPTOFILE":
+		dataMutex.Unlock() 
+		
+		filenameToDump := req.Filename
+		
+		// Use "CLIENT_DUMP" as the operation type for logging
+		if err := saveData(filenameToDump, "CLIENT_DUMP"); err != nil {
+			resp = newResponse("ERROR", op, fmt.Sprintf("Failed to save data: %v", err), clientID, "", nil, nil)
+		} else {
+			finalFilename := filenameToDump
+			if finalFilename == "" {
+				finalFilename = *storeFile
+			}
+			resp = newResponse("OK", op, fmt.Sprintf("Data dumped successfully to %s.", finalFilename), clientID, "", nil, nil)
+		}
+		
+		dataMutex.Lock() 
+
+	case "LOAD":
+		dataMutex.Unlock() 
+		
+		if req.Filename == "" {
+			resp = newResponse("ERROR", op, "Missing filename for LOAD operation.", clientID, "", nil, nil)
+		} else if err := loadData(req.Filename); err != nil {
+			resp = newResponse("ERROR", op, fmt.Sprintf("Failed to load data: %v", err), clientID, "", nil, nil)
+		} else {
+			resp = newResponse("OK", op, fmt.Sprintf("Data loaded from %s.", req.Filename), clientID, "", nil, nil)
+		}
+		
+		dataMutex.Lock() 
+
+	case "BROADCAST":
+		if req.Message == "" {
+			resp = newResponse("ERROR", op, "Missing message.", clientID, "", nil, nil)
+		} else {
+			sendResponse(conn, newResponse("OK", op, "Broadcast sent.", clientID, "", nil, nil)) 
+			
+			dataMutex.Unlock() 
+			broadcastMessage(clientID, req.Message)
+			dataMutex.Lock() 
+			return 
+		}
+        
+	case "SETID":
+        newID := fmt.Sprintf("%v", req.NewID)
+        
+		dataMutex.Unlock() 
+
+        dataMutex.Lock() 
+        delete(clients, clientID)
+        clients[newID] = conn
+        dataMutex.Unlock() 
+
+		dataMutex.Lock() 
+		
+		resp = newResponse("OK", op, fmt.Sprintf("Client ID successfully updated to %s.", newID), newID, "", nil, nil)
+		
+		// Log the ID change
+		accessLogger(LOG_INFO, "main.handleRequest", clientAddr, "SET_ID", newID, fmt.Sprintf("ID changed from %s", clientID))
+		
+	default:
+		resp = newResponse("ERROR", op, fmt.Sprintf("Unknown operation: %s", op), clientID, "", nil, nil)
+	}
+
+	sendResponse(conn, resp)
+}
+
+// broadcastMessage sends a JSON broadcast message to all connected clients except the sender.
+func broadcastMessage(senderID string, message string) {
+	broadcastResp := newResponse("BROADCAST", "BROADCAST", message, senderID, "", nil, nil)
+	
+	dataMutex.RLock()
+	defer dataMutex.RUnlock()
+
+	accessLogger(LOG_ACTIVITY, "main.broadcastMessage", senderID, "BROADCAST_SEND", "", fmt.Sprintf("Sending message to %d clients.", len(clients)-1))
+
+	for clientID, clientConn := range clients {
+		if clientID != senderID {
+			go sendResponse(clientConn, broadcastResp)
+		}
+	}
 }
 
 // --- Connection Handler ---
 
 func handleConnection(conn net.Conn) {
-	// Verify TLS (Go handles the handshake before we get here, but we check verification)
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		conn.Close()
-		return
-	}
-
-	// Handshake usually happens on first Read/Write, but let's force it to check Auth
-	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("TLS Handshake failed: %s", err)
-		conn.Close()
-		return
-	}
-
-	state := tlsConn.ConnectionState()
-	if !state.HandshakeComplete || len(state.PeerCertificates) == 0 {
-		log.Println("Client rejected: Unauthorized certificate.")
-		conn.Write([]byte(`{"status":"ERROR","message":"Unauthorized client"}` + "\n"))
-		conn.Close()
-		return
-	}
-
-    // NewClientConnection now logs the connection and sets the full ID string
-	client := NewClientConnection(conn) 
-	defer client.Close()
-
-    // NEW: Send initial status message to client containing their full ID
-    initialStatus := Response{
-        Status: "STATUS",
-        Op: "CONNECTED",
-        Message: "Successfully connected and authenticated.",
-        SenderId: client.ID,
-    }
-    client.WriteJSON(initialStatus)
+	remoteAddr := conn.RemoteAddr().String()
+	
+	dataMutex.Lock()
+	clientIDCounter++
+	id := fmt.Sprintf("%d:%s", clientIDCounter, remoteAddr)
+    clients[id] = conn
+	dataMutex.Unlock()
+    
+	accessLogger(LOG_INFO, "main.handleConnection", remoteAddr, "CONNECT", id, "New client connected.")
+    
+	statusResp := newResponse("STATUS", "INIT", "Connection established.", id, "", nil, nil)
+	sendResponse(conn, statusResp)
 
 	scanner := bufio.NewScanner(conn)
+	currentClientID := id
+	
 	for scanner.Scan() {
-		rawMessage := scanner.Bytes()
-		if len(rawMessage) == 0 {
-			continue
-		}
-
-		var req Request
-		if err := json.Unmarshal(rawMessage, &req); err != nil {
-			client.WriteJSON(Response{Status: "ERROR", Message: "Invalid JSON: " + err.Error()})
-			continue
-		}
-
-		var resp Response
-
-		switch req.Op {
-		case "BROADCAST":
-			count := broadcastMessage(client.ID, req.Message) // client.ID is the string ID
-			resp = Response{
-				Status:   "OK",
-				Op:       "BROADCAST",
-				Message:  fmt.Sprintf("Message sent to %d clients.", count),
-				SenderId: client.ID,
-			}
-		case "SETID":
-            // Note: SETID expects a string ID but will append the network address if successful
-			if client.SetClientID(req.NewID) { 
-				resp = Response{Status: "OK", Op: "SETID", Message: fmt.Sprintf("Client ID changed to %v", client.ID)}
-			} else {
-				resp = Response{Status: "ERROR", Op: "SETID", Message: "Invalid ID provided."}
-			}
-
-		case "LOAD", "INIT":
-            // ... (Load/Init logic remains the same) ...
-            
-			dataToLoad := req.Data
-			source := "inline object"
-
-			if req.Filename != "" {
-				fileBytes, err := os.ReadFile(req.Filename)
-				if err != nil {
-					client.WriteJSON(Response{Status: "ERROR", Op: req.Op, Message: "Failed to load file: " + err.Error()})
-					continue
-				}
-				if err := json.Unmarshal(fileBytes, &dataToLoad); err != nil {
-					client.WriteJSON(Response{Status: "ERROR", Op: req.Op, Message: "Invalid JSON in file."})
-					continue
-				}
-				source = "file " + req.Filename
-			}
-
-			if req.Op == "LOAD" {
-				store.LoadData(dataToLoad)
-				resp = Response{Status: "OK", Op: "LOAD", Message: fmt.Sprintf("Data merged from %s.", source)}
-			} else {
-				store.InitializeData(dataToLoad)
-				resp = Response{Status: "OK", Op: "INIT", Message: fmt.Sprintf("Store initialized from %s.", source)}
-			}
-
-		case "SEARCH", "SEARCHKEY":
-            // ... (Search logic remains the same) ...
-			term := strings.ToLower(fmt.Sprintf("%v", req.Term)) 
-			opType := "SEARCH"
-			if req.Op == "SEARCHKEY" {
-				opType = "SEARCHKEY"
-			}
-			log.Printf("Client %v: %s term='%v'", client.ID, opType, req.Term)
-
-			results := make(map[string]interface{})
-			
-			store.Lock.RLock()
-			for k, v := range store.Data {
-				lowerKey := strings.ToLower(k)
-				match := false
-				if req.Op == "SEARCHKEY" {
-					if strings.Contains(lowerKey, term) { 
-						match = true
-					}
-				} else {
-					// SEARCH (Value and Key)
-					jsonVal, _ := json.Marshal(v)
-					if strings.Contains(lowerKey, term) || strings.Contains(strings.ToLower(string(jsonVal)), term) { 
-						match = true
-					}
-				}
-
-				if match {
-					results[k] = v
-				}
-			}
-			store.Lock.RUnlock()
-			resp = Response{Status: "OK", Op: req.Op, Results: results}
-		
-		// --- Blob Operations (Added Logged Stubs) ---
-		case "PUTBLOB":
-			log.Printf("Client %v: PUTBLOB key='%s' (unimplemented)", client.ID, req.Key)
-			resp = Response{Status: "ERROR", Op: "PUTBLOB", Message: "Operation not implemented"}
-
-		case "DELETEBLOB":
-			log.Printf("Client %v: DELETEBLOB key='%s' (unimplemented)", client.ID, req.Key)
-			resp = Response{Status: "ERROR", Op: "DELETEBLOB", Message: "Operation not implemented"}
-
-		case "GETBLOB":
-			log.Printf("Client %v: GETBLOB key='%s' (unimplemented)", client.ID, req.Key)
-			resp = Response{Status: "ERROR", Op: "GETBLOB", Message: "Operation not implemented"}
-		// ---------------------------------------------
-		
-		case "DUMPTOFILE":
-			log.Printf("Client %v: DUMPTOFILE triggered", client.ID)
-			// Use the dumpFile pointer value
-			resp = store.DumpToFile(*dumpFile) 
-
-		case "DUMP":
-            // ... (Dump logic remains the same) ...
-			log.Printf("Client %v: DUMP full store", client.ID)
-			store.Lock.RLock()
-			// Copy map to avoid race conditions during serialization after unlock
-			copyData := make(map[string]interface{})
-			for k, v := range store.Data {
-				copyData[k] = v
-			}
-			store.Lock.RUnlock()
-			resp = Response{Status: "OK", Op: "DUMP", Data: copyData}
-
-		case "SET":
-			store.Lock.Lock()
-			store.Data[req.Key] = req.Value
-			store.Lock.Unlock()
-			log.Printf("Client %v: SET key='%s'", client.ID, req.Key)
-			resp = Response{Status: "OK", Op: "SET", Key: req.Key}
-
-		case "GET":
-			store.Lock.RLock()
-			val, exists := store.Data[req.Key]
-			store.Lock.RUnlock()
-			if exists {
-				resp = Response{Status: "OK", Op: "GET", Key: req.Key, Value: val}
-				log.Printf("Client %v: GET key='%s' -> FOUND", client.ID, req.Key)
-			} else {
-				resp = Response{Status: "NOT_FOUND", Op: "GET", Key: req.Key}
-				log.Printf("Client %v: GET key='%s' -> NOT_FOUND", client.ID, req.Key)
-			}
-
-		case "DELETE":
-			store.Lock.Lock()
-			_, exists := store.Data[req.Key]
-			if exists {
-				delete(store.Data, req.Key)
-				store.Lock.Unlock()
-				resp = Response{Status: "OK", Op: "DELETE", Key: req.Key}
-				log.Printf("Client %v: DELETE key='%s' -> SUCCESS", client.ID, req.Key)
-			} else {
-				store.Lock.Unlock()
-				resp = Response{Status: "NOT_FOUND", Op: "DELETE", Key: req.Key}
-				log.Printf("Client %v: DELETE key='%s' -> NOT_FOUND", client.ID, req.Key)
-			}
-
-		default:
-			resp = Response{Status: "ERROR", Message: "Unknown operation"}
-		}
+		rawReq := scanner.Bytes()
+		clientIDAtRequestTime := currentClientID 
         
-        // Ensure SenderId is always included in the response payload when sending
-        resp.SenderId = client.ID
+		go handleRequest(clientIDAtRequestTime, conn, rawReq)
+	}
 
-		client.WriteJSON(resp)
+	conn.Close()
+    
+	dataMutex.Lock()
+    delete(clients, currentClientID)
+	dataMutex.Unlock()
+	
+	// Log disconnect
+	if scanner.Err() != nil {
+		accessLogger(LOG_ERROR, "main.handleConnection", remoteAddr, "DISCONNECT", currentClientID, fmt.Sprintf("Client connection closed with error: %v", scanner.Err()))
+	} else {
+		accessLogger(LOG_INFO, "main.handleConnection", remoteAddr, "DISCONNECT", currentClientID, "Client disconnected gracefully.")
 	}
 }
 
-// --- Initialization and Main Server Start (No changes) ---
-
-func setupFlags() {
-	// Define the flags using the standard flag package
-	
-	// Server/Network Flags
-	// Host default is set to "localhost" (127.0.0.1)
-	host = flag.String("h", "localhost", "Host (long: --host): The interface the server listens on (default: localhost).")
-	port = flag.String("p", "9999", "Port (long: --port): The TCP port the server listens on.")
-	flag.StringVar(host, "host", "localhost", "Host (short: -h): The interface the server listens on (default: localhost).")
-	flag.StringVar(port, "port", "9999", "Port (short: -p): The TCP port the server listens on.")
-
-	// Security (mTLS) Flags
-	certFile = flag.String("c", "server.crt", "Server Cert Path (long: --cert).")
-	keyFile = flag.String("k", "server.key", "Server Private Key Path (long: --key).")
-	
-	// Client CA flag for consistency with client config
-	clientCA = flag.String("ca", "ca.crt", "Root CA Cert Path (long: --ca-cert) to verify clients.")
-	flag.StringVar(clientCA, "ca-cert", "ca.crt", "Root CA Certificate Path (short: -ca) to verify clients.")
-
-	// Data Persistence Flags
-	dumpFile = flag.String("dump-file", "store_dump.json", "Data Dump File: Filename for persistence of the main data store.")
-	dumpIntervalStr = flag.String("dt", "5m", "Periodic Dump Interval (long: --dump-time): Duration for automatically saving the store (e.g., 5s, 1m, 30m). Set to 0s to disable.") 
-    flag.StringVar(dumpIntervalStr, "dump-time", "5m", "Periodic Dump Interval (short: -dt): Duration for automatically saving the store (e.g., 5s, 1m, 30m). Set to 0s to disable.")
-
-	flag.Parse()
-}
+// --- Main Server Function ---
 
 func main() {
-	// Set up command-line flags
 	setupFlags()
+	
+	accessLogger(LOG_INFO, "main.main", "", "SERVER_START", "", fmt.Sprintf("Server starting on %s:%s...", *host, *port))
 
-	// 1. Start Periodic Dump
+    // Set the file path for the graceful shutdown dump. Default to --dump-file.
+    finalDumpFile := *exitDumpFile
+    if finalDumpFile == "" {
+        finalDumpFile = *storeFile
+    }
+
+    // --- Signal Handling for Graceful Exit ---
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+    go func() {
+        sig := <-sigChan
+        accessLogger(LOG_WARN, "main.signalHandler", "", "GRACEFUL_EXIT", finalDumpFile, fmt.Sprintf("Received signal %v. Initiating shutdown.", sig))
+
+        // Perform final dump using the determined exit file
+		// Use "EXIT_DUMP" as the operation type for logging
+        if err := saveData(finalDumpFile, "EXIT_DUMP"); err != nil {
+            accessLogger(LOG_FATAL, "main.signalHandler", "", "EXIT_DUMP_FAIL", finalDumpFile, fmt.Sprintf("Failed final data dump: %v", err))
+        } else {
+            accessLogger(LOG_INFO, "main.signalHandler", "", "EXIT_SUCCESS", finalDumpFile, "Final data store dumped. Shutting down.")
+        }
+
+        dataMutex.Lock()
+        for _, conn := range clients {
+            conn.Close()
+        }
+        dataMutex.Unlock()
+
+        os.Exit(0)
+    }()
+    // --------------------------------------------------
+
+	// --- 1. Load Data from Store File at Startup ---
+	if *loadFile != "" {
+		dataMutex.Lock()
+		if err := loadData(*loadFile); err != nil { 
+			// Load failure handled within loadData log, here we just check for the error type
+			accessLogger(LOG_WARN, "main.main", "", "INIT_LOAD", *loadFile, fmt.Sprintf("Initial load error: %v.", err))
+		}
+		dataMutex.Unlock()
+	} else {
+        accessLogger(LOG_INFO, "main.main", "", "INIT_LOAD", "", "No load-file specified. Starting with an empty store.")
+    }
+
+	// --- 2. Start Periodic Dump ---
 	startPeriodicDump()
 
-	// 2. Load CA to verify clients
+	// --- 3. Setup mTLS Configuration ---
+	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	if err != nil {
+		accessLogger(LOG_FATAL, "main.main", "", "TLS_CONFIG", *certFile, fmt.Sprintf("Failed to load server key pair: %v", err))
+		log.Fatalf("Failed to load server key pair: %v", err)
+	}
+
 	caCert, err := os.ReadFile(*clientCA)
 	if err != nil {
-		log.Fatalf("Error reading client CA cert %s: %v", *clientCA, err)
+		accessLogger(LOG_FATAL, "main.main", "", "TLS_CONFIG", *clientCA, fmt.Sprintf("Failed to read client CA cert: %v", err))
+		log.Fatalf("Failed to read client CA cert: %v", err)
 	}
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(caCert)
 
-	// 3. Load Server Cert/Key
-	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
-	if err != nil {
-		log.Fatalf("Error loading server key pair %s/%s: %v", *certFile, *keyFile, err)
-	}
-
-	// Configure mTLS to require and verify the client certificate.
-	config := &tls.Config{
+	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientCAs:    caCertPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert, 
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
-    
-	// 4. Start Listener
-	addr := *host + ":" + *port
-	listener, err := tls.Listen("tcp", addr, config)
-	if err != nil {
-		log.Fatalf("Listener error: %v", err)
-	}
-	defer func() {
-		// Log server closure
-		log.Printf("Server closed listening on %s", addr)
-		listener.Close()
-	}()
 
-	// Log server start
-	log.Printf("Server started listening on %s", addr)
+	// --- 4. Start Listener ---
+	addr := *host + ":" + *port
+	listener, err := tls.Listen("tcp", addr, tlsConfig)
+	if err != nil {
+		accessLogger(LOG_FATAL, "main.main", "", "LISTEN_FAIL", addr, fmt.Sprintf("Failed to start listener: %v", err))
+		log.Fatalf("Failed to start listener on %s: %v", addr, err)
+	}
+	defer listener.Close()
+
+	accessLogger(LOG_INFO, "main.main", "", "LISTEN_SUCCESS", addr, "Server listening securely. Awaiting connections.")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Accept error:", err)
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return 
+			}
+			accessLogger(LOG_ERROR, "main.main", "", "ACCEPT_FAIL", addr, fmt.Sprintf("Error accepting connection: %v", err))
 			continue
 		}
 		go handleConnection(conn)
